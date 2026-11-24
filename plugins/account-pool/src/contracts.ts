@@ -16,6 +16,62 @@ const httpUrlSchema = z.string().refine((value) => {
   }
 }, "Must be an HTTP or HTTPS URL.");
 
+export const proxyUrlSchema = z
+  .string()
+  .min(1)
+  .max(2048)
+  .regex(/^[\x21-\x7e]+$/u)
+  .transform((value, ctx) => {
+    let url: URL | null = null;
+    try {
+      url = new URL(value);
+    } catch {
+      url = null;
+    }
+    if (
+      url === null ||
+      (url.protocol !== "http:" && url.protocol !== "https:") ||
+      url.hostname === "" ||
+      (url.pathname !== "" && url.pathname !== "/") ||
+      !/^https?:[\\/]*[^\\/]+\/?$/iu.test(value) ||
+      url.href.includes("?") ||
+      url.href.includes("#")
+    ) {
+      ctx.addIssue({
+        code: "custom",
+        message:
+          "Enter an HTTP or HTTPS proxy URL without a path, query, or fragment.",
+      });
+      return z.NEVER;
+    }
+    if (url.port === "0") {
+      ctx.addIssue({
+        code: "custom",
+        message: "Proxy port must be greater than 0.",
+      });
+      return z.NEVER;
+    }
+    if ((url.username === "") !== (url.password === "")) {
+      ctx.addIssue({
+        code: "custom",
+        message: "proxy credentials need both a username and a password",
+      });
+      return z.NEVER;
+    }
+    try {
+      decodeURIComponent(url.username);
+      decodeURIComponent(url.password);
+    } catch {
+      ctx.addIssue({
+        code: "custom",
+        message: "Proxy credentials have invalid percent encoding.",
+      });
+      return z.NEVER;
+    }
+    return url.href.slice(0, -1);
+  })
+  .pipe(z.string().max(2048));
+
 const switchThresholdSchema = z
   .number()
   .positive("Must be greater than 0.")
@@ -208,6 +264,11 @@ export type AccountQuota = z.infer<typeof quotaSchema>;
 
 export const accountSummarySchema = accountSchema.extend({
   lastUsedHostName: z.string().min(1).nullable(),
+  proxy: z
+    .object({ scheme: z.enum(["http", "https"]), host: z.string().min(1) })
+    .strict()
+    .nullable(),
+  proxyUnreadable: z.boolean(),
   ...quotaFieldsShape,
   inFlight: z.number().int().nonnegative(),
   status: z.enum(["disabled", "ready", "held", "exhausted", "error"]),
@@ -272,6 +333,7 @@ export const accountAddInputSchema = z
   .object({
     provider: z.literal("claude"),
     apiKey: z.string().min(1),
+    proxy: proxyUrlSchema.optional(),
     label: z.string().min(1).nullable(),
     priority: z.number().int(),
   })
@@ -283,6 +345,7 @@ export const loginTargetSchema = z.discriminatedUnion("kind", [
   z
     .object({
       kind: z.literal("add"),
+      proxy: proxyUrlSchema.optional(),
       label: z.string().min(1).nullable(),
       priority: z.number().int(),
     })
@@ -337,6 +400,10 @@ export const codexLoginPollSchema = z.discriminatedUnion("status", [
 export const accountIdInputSchema = z
   .object({ id: z.string().uuid() })
   .strict();
+
+export const accountSetProxyInputSchema = accountIdInputSchema.extend({
+  proxy: proxyUrlSchema.nullable(),
+});
 
 export const accountPriorityInputSchema = z
   .object({ accountId: z.string().uuid(), priority: z.number().int() })

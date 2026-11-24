@@ -7,7 +7,12 @@ import type { PluginKvStorage } from "@get-bb/plugin-sdk";
 import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
 import { afterEach, describe, expect, it } from "vitest";
 import type { Account } from "./contracts.js";
-import { AccountStore, QUOTA_MIGRATIONS, QuotaStore } from "./store.js";
+import {
+  AccountProxyUnreadableError,
+  AccountStore,
+  QUOTA_MIGRATIONS,
+  QuotaStore,
+} from "./store.js";
 
 const cleanups: Array<() => Promise<void>> = [];
 
@@ -60,6 +65,136 @@ describe("AccountStore", () => {
     expect(await store.list()).toEqual([
       expect.objectContaining({ accountUuid: null }),
     ]);
+  });
+
+  it("stores and removes a private proxy file independently of the account credential", async () => {
+    const dataDir = await mkdtemp(path.join(tmpdir(), "bb-account-store-"));
+    const host = createFakePluginHost({ pluginId: "account-pool", dataDir });
+    const secretsDir = path.join(dataDir, "secrets");
+    const store = new AccountStore(host.bb.storage.kv, secretsDir);
+    cleanups.push(async () => {
+      await host.harness.lifecycle.dispose();
+      await fs.rm(dataDir, { recursive: true, force: true });
+    });
+    const secret = { kind: "api-key", apiKey: "sk-test" } as const;
+    const { id } = await store.add(
+      {
+        provider: "claude",
+        kind: "api-key",
+        label: "Test",
+        email: null,
+        accountUuid: null,
+        subscriptionType: null,
+        rateLimitTier: null,
+        enabled: true,
+        priority: 100,
+      },
+      secret,
+    );
+    const file = path.join(secretsDir, `account-${id}.proxy.json`);
+    const proxy = "http://user:pass@proxy.invalid:3128";
+
+    expect(await store.readProxy(id)).toBeNull();
+    await store.writeProxy(id, `${proxy}/`);
+    expect(await host.bb.storage.kv.get("account-proxies:v1")).toEqual([id]);
+    expect(await store.readProxy(id)).toBe(proxy);
+    await host.bb.storage.kv.delete("account-proxies:v1");
+    expect(await store.readProxy(id)).toBe(proxy);
+    expect(await host.bb.storage.kv.get("account-proxies:v1")).toEqual([id]);
+    for (const invalid of [null, { id }, [id, id], ["invalid-account-id"]]) {
+      await host.bb.storage.kv.set("account-proxies:v1", invalid);
+      await expect(store.readProxy(id)).rejects.toThrow(
+        `Account ${id} proxy is unreadable.`,
+      );
+    }
+    await host.bb.storage.kv.set("account-proxies:v1", [id]);
+    expect(JSON.parse(await fs.readFile(file, "utf8"))).toEqual({ url: proxy });
+    expect((await fs.stat(file)).mode & 0o777).toBe(0o600);
+    expect(await store.readSecret(id)).toEqual(secret);
+
+    for (const broken of [
+      `{"url":"${proxy}`,
+      JSON.stringify({ url: proxy, extra: true }),
+    ]) {
+      await fs.writeFile(file, broken);
+      await expect(store.readProxy(id)).rejects.toBeInstanceOf(
+        AccountProxyUnreadableError,
+      );
+      await expect(store.readProxy(id)).rejects.toThrow(
+        `Account ${id} proxy is unreadable.`,
+      );
+    }
+    await fs.rm(file);
+    await expect(store.readProxy(id)).rejects.toBeInstanceOf(
+      AccountProxyUnreadableError,
+    );
+    await store.writeProxy(id, null);
+    expect(await host.bb.storage.kv.get("account-proxies:v1")).toEqual([]);
+    expect(await store.readProxy(id)).toBeNull();
+    await store.writeProxy(id, proxy);
+    expect(await store.remove(id)).toBe(true);
+    expect(await host.bb.storage.kv.get("account-proxies:v1")).toEqual([]);
+    await expect(fs.stat(file)).rejects.toMatchObject({ code: "ENOENT" });
+    await expect(store.readSecret(id)).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+    expect(await store.writeProxy(id, proxy)).toBe(false);
+  });
+
+  it("keeps the proxy registered until the removed account is no longer stored", async () => {
+    const dataDir = await mkdtemp(path.join(tmpdir(), "bb-account-store-"));
+    const host = createFakePluginHost({ pluginId: "account-pool", dataDir });
+    cleanups.push(async () => {
+      await host.harness.lifecycle.dispose();
+      await fs.rm(dataDir, { recursive: true, force: true });
+    });
+    const kv = host.bb.storage.kv;
+    let beforeAccountRemoval: (() => Promise<void>) | undefined;
+    const store = new AccountStore(
+      {
+        get: (key) => kv.get(key),
+        list: (prefix) => kv.list(prefix),
+        delete: (key) => kv.delete(key),
+        set: async (key, value) => {
+          if (key === "accounts:v1") await beforeAccountRemoval?.();
+          return kv.set(key, value);
+        },
+      },
+      path.join(dataDir, "secrets"),
+    );
+    const { id } = await store.add(
+      {
+        provider: "claude",
+        kind: "api-key",
+        label: "Test",
+        email: null,
+        accountUuid: null,
+        subscriptionType: null,
+        rateLimitTier: null,
+        enabled: true,
+        priority: 100,
+      },
+      { kind: "api-key", apiKey: "sk-test" },
+      "http://user:pass@proxy.invalid:3128",
+    );
+    beforeAccountRemoval = async () => {
+      expect(await kv.get("account-proxies:v1")).toEqual([id]);
+      await expect(store.readProxy(id)).rejects.toBeInstanceOf(
+        AccountProxyUnreadableError,
+      );
+      throw new Error("Account removal interrupted.");
+    };
+    await expect(store.remove(id)).rejects.toThrow(
+      "Account removal interrupted.",
+    );
+    expect(await store.get(id)).not.toBeNull();
+    await expect(store.readAccountProxy(id)).rejects.toBeInstanceOf(
+      AccountProxyUnreadableError,
+    );
+    beforeAccountRemoval = undefined;
+    expect(await store.remove(id)).toBe(true);
+    expect(await kv.get("account-proxies:v1")).toEqual([]);
+    await expect(store.readAccountProxy(id)).rejects.toThrow("account removed");
   });
 
   it("preserves both accounts added concurrently", async () => {

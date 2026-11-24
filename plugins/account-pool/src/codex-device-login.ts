@@ -8,6 +8,7 @@ import {
 } from "./credentials.js";
 import type { AccountSummary, LoginTarget } from "./contracts.js";
 import { LoginTargetError } from "./operations.js";
+import { AccountRemovedError } from "./store.js";
 
 const LOGIN_SESSION_TTL_MS = 10 * 60 * 1_000;
 const DEVICE_CALLBACK_PATH = "/deviceauth/callback";
@@ -81,6 +82,7 @@ interface DeviceLoginSession {
   nextPollAt: number;
   polling: boolean;
   target: LoginTarget;
+  fetch: typeof fetch;
 }
 
 export interface CodexDeviceAccount {
@@ -97,7 +99,9 @@ export interface CodexDeviceLoginOptions {
   fetch?: typeof fetch;
   now?: () => number;
   authBaseUrl?: string;
-  validateTarget: (target: LoginTarget) => Promise<void>;
+  validateTarget?: (target: LoginTarget) => Promise<void>;
+  fetchForTarget?: (target: LoginTarget) => Promise<typeof fetch>;
+  forgetProxy?: (proxyUrl: string) => void;
   saveLogin: (
     authenticated: CodexDeviceAccount,
     target: LoginTarget,
@@ -181,12 +185,26 @@ export class CodexDeviceLogin {
   }
 
   async start(target: LoginTarget): Promise<CodexDeviceLoginStart> {
-    await this.options.validateTarget(target);
+    await this.options.validateTarget?.(target);
+    const sessionFetch =
+      (await this.options.fetchForTarget?.(target)) ?? this.fetch;
+    try {
+      return await this.startSession(target, sessionFetch);
+    } catch (error) {
+      this.forgetSessionProxy(target);
+      throw error;
+    }
+  }
+
+  private async startSession(
+    target: LoginTarget,
+    sessionFetch: typeof fetch,
+  ): Promise<CodexDeviceLoginStart> {
     const pruneBefore = this.now();
     for (const [sessionId, session] of this.sessions) {
       if (pruneBefore >= session.expiresAt) this.deleteSession(sessionId);
     }
-    const response = await this.fetch(
+    const response = await sessionFetch(
       `${this.authBaseUrl}/api/accounts/deviceauth/usercode`,
       {
         method: "POST",
@@ -219,6 +237,7 @@ export class CodexDeviceLogin {
       nextPollAt: now + intervalMs,
       polling: false,
       target,
+      fetch: sessionFetch,
     };
     this.sessions.set(session.sessionId, session);
     this.scheduleExpiry(session);
@@ -250,7 +269,7 @@ export class CodexDeviceLogin {
     session.polling = true;
     session.nextPollAt = now + session.intervalMs;
     try {
-      const response = await this.fetch(
+      const response = await session.fetch(
         `${this.authBaseUrl}/api/accounts/deviceauth/token`,
         {
           method: "POST",
@@ -265,12 +284,14 @@ export class CodexDeviceLogin {
         },
       );
       if (this.sessions.get(session.sessionId) !== session) {
+        await response.body?.cancel();
         return {
           status: "error",
           message: "Login session was not found. Start again.",
         };
       }
       if (this.now() >= session.expiresAt) {
+        await response.body?.cancel();
         this.deleteSession(session.sessionId);
         return { status: "error", message: "Code expired, start again." };
       }
@@ -320,9 +341,18 @@ export class CodexDeviceLogin {
             "Codex authorization returned an invalid response. Start again.",
         };
       }
-      this.deleteSession(session.sessionId);
-      return await this.exchange(parsed.data, session.target);
-    } catch {
+      if (this.takeSession(session.sessionId) === undefined) {
+        return {
+          status: "error",
+          message: "Login session was not found. Start again.",
+        };
+      }
+      return await this.completeExchange(parsed.data, session);
+    } catch (error) {
+      if (error instanceof AccountRemovedError) {
+        this.deleteSession(session.sessionId);
+        return { status: "error", message: error.message };
+      }
       if (this.now() < session.expiresAt) return { status: "pending" };
       this.deleteSession(session.sessionId);
       return { status: "error", message: "Code expired, start again." };
@@ -342,9 +372,7 @@ export class CodexDeviceLogin {
   }
 
   dispose(): void {
-    for (const timer of this.expiryTimers.values()) clearTimeout(timer);
-    this.expiryTimers.clear();
-    this.sessions.clear();
+    for (const sessionId of this.sessions.keys()) this.deleteSession(sessionId);
   }
 
   private scheduleExpiry(session: DeviceLoginSession): void {
@@ -357,17 +385,53 @@ export class CodexDeviceLogin {
   }
 
   private deleteSession(sessionId: string): boolean {
+    const session = this.takeSession(sessionId);
+    if (session === undefined) return false;
+    this.forgetSessionProxy(session.target);
+    return true;
+  }
+
+  private takeSession(sessionId: string): DeviceLoginSession | undefined {
     const timer = this.expiryTimers.get(sessionId);
     if (timer !== undefined) clearTimeout(timer);
     this.expiryTimers.delete(sessionId);
-    return this.sessions.delete(sessionId);
+    const session = this.sessions.get(sessionId);
+    this.sessions.delete(sessionId);
+    return session;
+  }
+
+  private forgetSessionProxy(target: LoginTarget): void {
+    if (target.kind === "add" && target.proxy !== undefined)
+      this.options.forgetProxy?.(target.proxy);
+  }
+
+  private async completeExchange(
+    authorized: z.infer<typeof deviceTokenResponseSchema>,
+    session: DeviceLoginSession,
+  ): Promise<CodexDeviceLoginPoll> {
+    let saved = false;
+    try {
+      const result = await this.exchange(authorized, session);
+      saved = result.status === "complete";
+      return result;
+    } catch (error) {
+      return {
+        status: "error",
+        message:
+          error instanceof AccountRemovedError
+            ? error.message
+            : "Codex token exchange failed. Start again.",
+      };
+    } finally {
+      if (!saved) this.forgetSessionProxy(session.target);
+    }
   }
 
   private async exchange(
     authorized: z.infer<typeof deviceTokenResponseSchema>,
-    target: LoginTarget,
+    session: DeviceLoginSession,
   ): Promise<CodexDeviceLoginPoll> {
-    const response = await this.fetch(`${this.authBaseUrl}/oauth/token`, {
+    const response = await session.fetch(`${this.authBaseUrl}/oauth/token`, {
       method: "POST",
       headers: {
         accept: "application/json",
@@ -409,7 +473,7 @@ export class CodexDeviceLogin {
           idToken: parsed.data.id_token,
           expiresAt: codexAccessTokenExpiresAt(parsed.data.access_token),
         },
-        target,
+        session.target,
       );
       return { status: "complete", account };
     } catch (error) {

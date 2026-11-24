@@ -76,6 +76,8 @@ function summary(account: CodexDeviceAccount): AccountSummary {
     lastUsedAt: null,
     lastUsedHostId: null,
     lastUsedHostName: null,
+    proxy: null,
+    proxyUnreadable: false,
     representativeClaim: null,
     familyWeekly: {
       fable: null,

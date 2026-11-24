@@ -8,12 +8,17 @@ import { z } from "zod";
 import {
   accountSchema,
   accountSummarySchema,
+  codexLoginPollSchema,
+  codexLoginStartSchema,
   loginStartSchema,
   statusSchema,
   type Account,
   type LoginTarget,
 } from "./contracts.js";
-import { createAccountPoolPlugin } from "./server.js";
+import {
+  createAccountPoolPlugin,
+  type AccountPoolPluginOptions,
+} from "./server.js";
 import { AccountStore } from "./store.js";
 
 const UPSTREAM = "https://anthropic.test";
@@ -47,6 +52,8 @@ const SPOUSE: Identity = {
 const cleanups: Array<() => Promise<void>> = [];
 
 afterEach(async () => {
+  vi.useRealTimers();
+  vi.unstubAllGlobals();
   while (cleanups.length > 0) await cleanups.pop()?.();
 });
 
@@ -177,7 +184,10 @@ class FakeProviders {
   };
 }
 
-async function startPool(providers: FakeProviders) {
+async function startPool(
+  providers: FakeProviders,
+  options: Pick<AccountPoolPluginOptions, "fetch" | "fetchVia" | "now"> = {},
+) {
   const dataDir = await mkdtemp(path.join(tmpdir(), "bb-account-login-"));
   const host = createFakePluginHost({
     pluginId: "account-pool",
@@ -199,6 +209,7 @@ async function startPool(providers: FakeProviders) {
   });
   await createAccountPoolPlugin({
     fetch: providers.fetch,
+    env: {},
     refreshUrl: `${AUTH}/token`,
     usageUrl: `${AUTH}/usage`,
     oauthAuthorizeUrl: `${AUTH}/authorize`,
@@ -206,6 +217,7 @@ async function startPool(providers: FakeProviders) {
     oauthProfileUrl: `${AUTH}/profile`,
     codexAuthBaseUrl: CODEX_AUTH,
     codexUsageUrl: `${CODEX_AUTH}/codex-usage`,
+    ...options,
   })(host.bb);
   const service = host.harness.behavior.runService("hub");
   cleanups.push(async () => {
@@ -291,6 +303,340 @@ async function sendMessage(pool: Pool, sessionId: string): Promise<number> {
 }
 
 describe("Account Pooler logins", () => {
+  it("uses the Claude account proxy for code exchange, profile, usage, refresh, forwarding, and re-login", async () => {
+    const providers = new FakeProviders();
+    const proxy = "http://user:pass@proxy.invalid:3128";
+    const requests: Array<[string, string | null]> = [];
+    const pool = await startPool(providers, {
+      fetchVia: (address) => async (input, init) => {
+        const request = new Request(input, init);
+        requests.push([new URL(request.url).pathname, address]);
+        return providers.fetch(request);
+      },
+    });
+    const account = await signInClaude(pool, providers, ME, {
+      kind: "add",
+      label: "Proxied",
+      priority: 1,
+      proxy: `${proxy}/`,
+    });
+    expect(requests.splice(0)).toEqual([
+      ["/token", proxy],
+      ["/profile", proxy],
+      ["/usage", proxy],
+    ]);
+    expect(await pool.store.readProxy(account.id)).toBe(proxy);
+    expect(await summary(pool, account.id)).toMatchObject({
+      proxy: { scheme: "http", host: "proxy.invalid:3128" },
+    });
+
+    const secret = await pool.store.readSecret(account.id);
+    if (secret.kind !== "oauth") throw new Error("Expected an OAuth secret.");
+    await pool.store.writeSecret(account.id, {
+      ...secret,
+      expiresAt: Date.now() - 1_000,
+    });
+    expect(await sendMessage(pool, "session-proxy")).toBe(200);
+    expect(requests.splice(0)).toEqual([
+      ["/token", proxy],
+      ["/v1/messages", proxy],
+    ]);
+    expect(await pool.store.readProxy(account.id)).toBe(proxy);
+
+    expect(
+      (
+        await signInClaude(pool, providers, ME, {
+          kind: "relogin",
+          accountId: account.id,
+        })
+      ).id,
+    ).toBe(account.id);
+    expect(requests.splice(0)).toEqual([
+      ["/token", proxy],
+      ["/profile", proxy],
+      ["/usage", proxy],
+    ]);
+    expect(await pool.store.readProxy(account.id)).toBe(proxy);
+
+    const replacement = "https://user:pass@replacement.invalid:8443";
+    await pool.host.harness.behavior.callRpc("account.setProxy", {
+      id: account.id,
+      proxy: replacement,
+    });
+    expect(requests.splice(0)).toEqual([["/usage", replacement]]);
+    const proxyFile = path.join(
+      pool.host.bb.storage.experimental_directory(),
+      "accounts",
+      `account-${account.id}.proxy.json`,
+    );
+    await fs.writeFile(proxyFile, `{"url":"${replacement}`);
+    await pool.host.harness.behavior.callRpc("account.refreshUsage", {
+      accountId: account.id,
+    });
+    expect(requests).toEqual([]);
+    expect(await summary(pool, account.id)).toMatchObject({
+      proxyUnreadable: true,
+      status: "error",
+    });
+    const rpc = pool.host.harness.behavior;
+    const started = loginStartSchema.parse(
+      await rpc.callRpc("login.start", {
+        kind: "relogin",
+        accountId: account.id,
+      }),
+    );
+    const state = new URL(started.authorizeUrl).searchParams.get("state");
+    await expect(
+      rpc.callRpc("login.complete", {
+        sessionId: started.sessionId,
+        pasted: `code#${state}`,
+      }),
+    ).rejects.toThrow(/proxy is unreadable/u);
+    expect(requests).toEqual([]);
+
+    const direct = await signInClaude(pool, providers, SPOUSE, {
+      kind: "add",
+      label: "Direct",
+      priority: 2,
+    });
+    expect(requests.splice(0)).toEqual([
+      ["/token", null],
+      ["/profile", null],
+      ["/usage", null],
+    ]);
+    await pool.host.harness.behavior.callRpc("account.disable", {
+      id: account.id,
+    });
+    expect(await sendMessage(pool, "session-direct")).toBe(200);
+    expect(requests.splice(0)).toEqual([["/v1/messages", null]]);
+    expect(await pool.store.readProxy(direct.id)).toBeNull();
+  });
+
+  it("uses the current Codex account proxy for each request during re-login", async () => {
+    const providers = new FakeProviders();
+    const proxy = "http://user:pass@proxy.invalid:3128";
+    const requests: Array<[string, string | null]> = [];
+    let now = Date.now();
+    const pool = await startPool(providers, {
+      now: () => now,
+      fetchVia: (address) => async (input, init) => {
+        const request = new Request(input, init);
+        requests.push([new URL(request.url).pathname, address]);
+        return providers.fetch(request);
+      },
+    });
+    providers.nextCodexLogin = {
+      accountId: "workspace-a",
+      email: "codex@example.com",
+    };
+    const rpc = pool.host.harness.behavior;
+    const complete = async (
+      target: LoginTarget,
+      beforePoll?: () => Promise<void>,
+    ) => {
+      const started = codexLoginStartSchema.parse(
+        await rpc.callRpc("codexLogin.start", target),
+      );
+      await beforePoll?.();
+      now += started.intervalMs;
+      const result = codexLoginPollSchema.parse(
+        await rpc.callRpc("codexLogin.poll", { sessionId: started.sessionId }),
+      );
+      if (result.status !== "complete")
+        throw new Error("Codex sign-in did not complete.");
+      expect(JSON.stringify([started, result])).not.toContain("user:pass");
+      return result.account;
+    };
+    const routes = [
+      ["/api/accounts/deviceauth/usercode", proxy],
+      ["/api/accounts/deviceauth/token", proxy],
+      ["/oauth/token", proxy],
+      ["/codex-usage", proxy],
+    ];
+    const account = await complete({
+      kind: "add",
+      label: null,
+      priority: 1,
+      proxy,
+    });
+    expect(requests.splice(0)).toEqual(routes);
+    expect(await pool.store.readProxy(account.id)).toBe(proxy);
+    expect(
+      (await complete({ kind: "relogin", accountId: account.id })).id,
+    ).toBe(account.id);
+    expect(requests.splice(0)).toEqual(routes);
+    expect(await pool.store.readProxy(account.id)).toBe(proxy);
+
+    await complete({ kind: "relogin", accountId: account.id }, async () => {
+      await rpc.callRpc("account.setProxy", { id: account.id, proxy: null });
+    });
+    expect(requests.splice(0)).toEqual([
+      ["/api/accounts/deviceauth/usercode", proxy],
+      ["/codex-usage", null],
+      ["/api/accounts/deviceauth/token", null],
+      ["/oauth/token", null],
+      ["/codex-usage", null],
+    ]);
+
+    await complete({ kind: "relogin", accountId: account.id }, async () => {
+      await rpc.callRpc("account.setProxy", { id: account.id, proxy });
+    });
+    expect(requests).toEqual([
+      ["/api/accounts/deviceauth/usercode", null],
+      ["/codex-usage", proxy],
+      ["/api/accounts/deviceauth/token", proxy],
+      ["/oauth/token", proxy],
+      ["/codex-usage", proxy],
+    ]);
+    expect(await pool.store.readProxy(account.id)).toBe(proxy);
+  });
+
+  it("uses a proxy added after Claude re-login starts and rechecks it before profile lookup", async () => {
+    const providers = new FakeProviders();
+    const proxy = "http://user:pass@proxy.invalid:3128";
+    const requests: Array<[string, string | null]> = [];
+    let afterToken: (() => Promise<void>) | undefined;
+    const pool = await startPool(providers, {
+      fetchVia: (address) => async (input, init) => {
+        const request = new Request(input, init);
+        const pathname = new URL(request.url).pathname;
+        requests.push([pathname, address]);
+        const response = await providers.fetch(request);
+        if (pathname === "/token") await afterToken?.();
+        return response;
+      },
+    });
+    const account = await signInClaude(pool, providers, ME, {
+      kind: "add",
+      label: null,
+      priority: 1,
+    });
+    const rpc = pool.host.harness.behavior;
+    const started = loginStartSchema.parse(
+      await rpc.callRpc("login.start", {
+        kind: "relogin",
+        accountId: account.id,
+      }),
+    );
+    await rpc.callRpc("account.setProxy", { id: account.id, proxy });
+    afterToken = async () => {
+      await rpc.callRpc("account.setProxy", { id: account.id, proxy: null });
+    };
+    requests.length = 0;
+    const state = new URL(started.authorizeUrl).searchParams.get("state");
+    expect(
+      await rpc.callRpc("login.complete", {
+        sessionId: started.sessionId,
+        pasted: `code#${state}`,
+      }),
+    ).toMatchObject({ id: account.id });
+    expect(requests).toEqual([
+      ["/token", proxy],
+      ["/usage", null],
+      ["/profile", null],
+      ["/usage", null],
+    ]);
+  });
+
+  it("closes temporary Codex add agents on cancellation and expiry and retains the saved proxy", async () => {
+    const providers = new FakeProviders();
+    const proxy = "http://user:pass@proxy.invalid:3128";
+    const agents: Array<{ closed: boolean }> = [];
+    vi.stubGlobal(
+      "fetch",
+      async (
+        input: Parameters<typeof fetch>[0],
+        init: RequestInit & { dispatcher: { closed: boolean } },
+      ) => {
+        agents.push(init.dispatcher);
+        return providers.fetch(input, init);
+      },
+    );
+    let now = Date.now();
+    const pool = await startPool(providers, {
+      fetch: undefined,
+      now: () => now,
+    });
+    const rpc = pool.host.harness.behavior;
+    providers.nextCodexLogin = {
+      accountId: "workspace-a",
+      email: "codex@example.com",
+    };
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const start = async () =>
+      codexLoginStartSchema.parse(
+        await rpc.callRpc("codexLogin.start", {
+          kind: "add",
+          label: null,
+          priority: 1,
+          proxy,
+        }),
+      );
+
+    const cancelled = await start();
+    expect(
+      await rpc.callRpc("codexLogin.cancel", {
+        sessionId: cancelled.sessionId,
+      }),
+    ).toEqual({ cancelled: true });
+    const cancelledAgent = agents.pop();
+    expect(cancelledAgent).toHaveProperty("closed", true);
+
+    const expired = await start();
+    const expiredAgent = agents.pop();
+    expect(expiredAgent).not.toBe(cancelledAgent);
+    await vi.advanceTimersByTimeAsync(expired.expiresAt - now);
+    expect(expiredAgent).toHaveProperty("closed", true);
+
+    const saved = await start();
+    now += saved.intervalMs;
+    const result = codexLoginPollSchema.parse(
+      await rpc.callRpc("codexLogin.poll", { sessionId: saved.sessionId }),
+    );
+    if (result.status !== "complete")
+      throw new Error("Codex sign-in did not complete.");
+    const savedAgent = agents[0];
+    expect(agents).toHaveLength(4);
+    expect(new Set(agents).size).toBe(1);
+    expect(savedAgent).toHaveProperty("closed", false);
+    expect(await pool.store.readProxy(result.account.id)).toBe(proxy);
+    await rpc.callRpc("account.remove", { id: result.account.id });
+    expect(savedAgent).toHaveProperty("closed", true);
+  });
+
+  it("closes the temporary Claude add agent when the token exchange fails", async () => {
+    const providers = new FakeProviders();
+    const agents: Array<{ closed: boolean }> = [];
+    vi.stubGlobal(
+      "fetch",
+      async (
+        input: Parameters<typeof fetch>[0],
+        init: RequestInit & { dispatcher: { closed: boolean } },
+      ) => {
+        agents.push(init.dispatcher);
+        return providers.fetch(input, init);
+      },
+    );
+    const pool = await startPool(providers, { fetch: undefined });
+    const rpc = pool.host.harness.behavior;
+    const started = loginStartSchema.parse(
+      await rpc.callRpc("login.start", {
+        kind: "add",
+        label: null,
+        priority: 1,
+        proxy: "http://user:pass@proxy.invalid:3128",
+      }),
+    );
+    const state = new URL(started.authorizeUrl).searchParams.get("state");
+    await expect(
+      rpc.callRpc("login.complete", {
+        sessionId: started.sessionId,
+        pasted: `code#${state}`,
+      }),
+    ).rejects.toThrow(/token exchange failed/u);
+    expect(agents).toEqual([expect.objectContaining({ closed: true })]);
+  });
+
   it("re-login replaces a refresh chain shared with this machine without touching the machine's chain", async () => {
     const providers = new FakeProviders();
     const pool = await startPool(providers);

@@ -11,11 +11,13 @@ import {
   accountIdInputSchema,
   accountPriorityInputSchema,
   accountReorderInputSchema,
+  accountSetProxyInputSchema,
   accountPoolConfigSetInputSchema,
   bypassInputSchema,
   codexLoginPollInputSchema,
   loginCompleteInputSchema,
   modelFamilySchema,
+  loginTargetSchema,
   parentModeSchema,
   tokenRotateInputSchema,
   routingSetInputSchema,
@@ -45,6 +47,13 @@ const DESCRIPTION = [
 const JSON_OPTION = {
   type: "boolean",
   description: "Emit machine-readable JSON",
+} as const;
+
+const PROXY_OPTION = {
+  type: "string",
+  stdin: true,
+  description:
+    "Account HTTP(S) proxy URL. Use --proxy-stdin. Unsafe: exposes the proxy URL in process arguments, shell history, and agent transcripts when passed as an argument",
 } as const;
 
 const PROVIDER_OPTION = {
@@ -124,6 +133,7 @@ function formatAccounts(accounts: readonly AccountSummary[]): string {
       "Kind",
       "Enabled",
       "Priority",
+      "Proxy",
       "Windows",
       "Extra usage",
       ...families.map(familyLabel),
@@ -138,6 +148,11 @@ function formatAccounts(accounts: readonly AccountSummary[]): string {
         account.kind,
         String(account.enabled),
         String(account.priority),
+        account.proxyUnreadable
+          ? "unreadable"
+          : account.proxy === null
+            ? ""
+            : `${account.proxy.scheme}://${account.proxy.host}`,
         formatLimitWindows(account.limitWindows),
         account.extraUsage?.status ?? "-",
         ...families.map((family) =>
@@ -300,7 +315,7 @@ export function registerPoolCli(
           summary:
             "Sign in to a Claude or Codex account, or add an Anthropic API key",
           description:
-            "--login prints the browser or device step and exits; finish it with `bb pool account login-complete` (Claude) or `bb pool account login-poll` (Codex).\nThe pool keeps its own login, separate from this machine's Claude Code or Codex login, so neither signs the other out.",
+            "--login prints the browser or device step and exits; finish it with `bb pool account login-complete` (Claude) or `bb pool account login-poll` (Codex).\nThe pool keeps its own login, separate from this machine's Claude Code or Codex login, so neither signs the other out.\nUse --proxy-stdin with --login. When using --api-key-stdin, add the proxy separately with `bb pool account proxy <id> --proxy-stdin`; stdin accepts one secret per command.",
           unexpectedPositionalHint:
             "the provider belongs in --provider <claude|codex>, not a bare argument",
           options: {
@@ -319,6 +334,7 @@ export function registerPoolCli(
               description:
                 "Anthropic API key, --provider claude only. Unsafe: exposes the key in process arguments, shell history, and agent transcripts",
             },
+            proxy: PROXY_OPTION,
             label: {
               type: "string",
               placeholder: "text",
@@ -345,11 +361,12 @@ export function registerPoolCli(
               if (input.options.login) {
                 return startLogin(
                   provider,
-                  {
+                  loginTargetSchema.parse({
                     kind: "add",
+                    proxy: input.options.proxy,
                     label: input.options.label ?? null,
                     priority: input.options.priority,
-                  },
+                  }),
                   input.options.json === true,
                 );
               }
@@ -361,6 +378,7 @@ export function registerPoolCli(
               }
               const parsed = accountAddInputSchema.parse({
                 provider,
+                proxy: input.options.proxy,
                 apiKey: input.options["api-key"],
                 label: input.options.label ?? null,
                 priority: input.options.priority,
@@ -373,6 +391,33 @@ export function registerPoolCli(
                   : `Added ${account.label} (${account.id}).\n`,
               };
             }),
+        }),
+        "account proxy": cliCommand({
+          summary: "Set or remove an account's outbound proxy",
+          positionals: [ACCOUNT_ID_POSITIONAL],
+          options: {
+            proxy: PROXY_OPTION,
+            off: { type: "boolean", description: "Remove the account proxy" },
+            json: JSON_OPTION,
+          },
+          constraints: [{ kind: "exactly-one", options: ["proxy", "off"] }],
+          run: async (input) => {
+            const { id, proxy } = accountSetProxyInputSchema.parse({
+              id: input.positionals.id,
+              proxy: input.options.off ? null : input.options.proxy,
+            });
+            const account = await operations.setProxy(id, proxy);
+            if (account === null)
+              throw new PluginCliError(`Account ${id} does not exist.`, {
+                code: "account_not_found",
+              });
+            return {
+              exitCode: 0,
+              stdout: input.options.json
+                ? json({ ok: true, account })
+                : `${proxy === null ? "Removed the proxy for" : "Set the proxy for"} ${account.label}.\n`,
+            };
+          },
         }),
         "account login": cliCommand({
           summary:

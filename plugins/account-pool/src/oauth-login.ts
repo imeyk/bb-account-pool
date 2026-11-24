@@ -50,6 +50,7 @@ interface LoginSession {
   state: string;
   createdAt: number;
   target: LoginTarget;
+  fetch: typeof fetch;
 }
 
 export interface ClaudeOAuthAccount {
@@ -69,7 +70,9 @@ export interface ClaudeOAuthLoginOptions {
   authorizeUrl?: string;
   tokenUrl?: string;
   profileUrl?: string;
-  validateTarget: (target: LoginTarget) => Promise<void>;
+  validateTarget?: (target: LoginTarget) => Promise<void>;
+  fetchForTarget?: (target: LoginTarget) => Promise<typeof fetch>;
+  forgetProxy?: (proxyUrl: string) => void;
   saveLogin: (
     authenticated: ClaudeOAuthAccount,
     target: LoginTarget,
@@ -125,6 +128,7 @@ export function parseManualCode(
 
 export class ClaudeOAuthLogin {
   private session: LoginSession | null = null;
+  private expiryTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly fetch: typeof fetch;
   private readonly now: () => number;
   private readonly authorizeUrl: string;
@@ -140,20 +144,28 @@ export class ClaudeOAuthLogin {
   }
 
   async start(target: LoginTarget): Promise<OAuthLoginStart> {
-    await this.options.validateTarget(target);
+    await this.options.validateTarget?.(target);
+    const sessionFetch =
+      (await this.options.fetchForTarget?.(target)) ?? this.fetch;
     const codeVerifier = randomBytes(32).toString("base64url");
     const codeChallenge = createHash("sha256")
       .update(codeVerifier)
       .digest("base64url");
     const state = randomBytes(32).toString("base64url");
     const sessionId = randomUUID();
+    this.dispose();
     this.session = {
       sessionId,
       codeVerifier,
       state,
       createdAt: this.now(),
       target,
+      fetch: sessionFetch,
     };
+    if (target.kind === "add" && target.proxy !== undefined) {
+      this.expiryTimer = setTimeout(() => this.dispose(), LOGIN_SESSION_TTL_MS);
+      this.expiryTimer.unref();
+    }
     const authorizeUrl = new URL(this.authorizeUrl);
     authorizeUrl.searchParams.set("code", "true");
     authorizeUrl.searchParams.set("client_id", OAUTH_CLIENT_ID);
@@ -171,12 +183,42 @@ export class ClaudeOAuthLogin {
     if (session === null || session.sessionId !== input.sessionId) {
       throw new Error("Login session was not found. Start again.");
     }
+    this.takeSession();
+    try {
+      return await this.exchange(input.pasted, session);
+    } catch (error) {
+      this.forgetSessionProxy(session);
+      throw error;
+    }
+  }
+
+  dispose(): void {
+    const session = this.takeSession();
+    if (session !== null) this.forgetSessionProxy(session);
+  }
+
+  private takeSession(): LoginSession | null {
+    const session = this.session;
     this.session = null;
+    if (this.expiryTimer !== null) clearTimeout(this.expiryTimer);
+    this.expiryTimer = null;
+    return session;
+  }
+
+  private forgetSessionProxy({ target }: LoginSession): void {
+    if (target.kind === "add" && target.proxy !== undefined)
+      this.options.forgetProxy?.(target.proxy);
+  }
+
+  private async exchange(
+    pasted: string,
+    session: LoginSession,
+  ): Promise<Account> {
     if (this.now() - session.createdAt >= LOGIN_SESSION_TTL_MS) {
       throw new Error("Code expired, start again.");
     }
-    const parsed = parseManualCode(input.pasted, session.state);
-    const tokenResponse = await this.fetch(this.tokenUrl, {
+    const parsed = parseManualCode(pasted, session.state);
+    const tokenResponse = await session.fetch(this.tokenUrl, {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
@@ -202,7 +244,7 @@ export class ClaudeOAuthLogin {
       );
     }
     const tokens = parsedTokens.data;
-    const profileResponse = await this.fetch(this.profileUrl, {
+    const profileResponse = await session.fetch(this.profileUrl, {
       headers: {
         authorization: `Bearer ${tokens.access_token}`,
         "anthropic-beta": OAUTH_BETA,

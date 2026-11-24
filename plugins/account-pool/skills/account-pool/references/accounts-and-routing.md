@@ -183,6 +183,35 @@ sequence without moving the current account. `bb pool account priority <id> <n>`
 sets an individual priority; the same operations are available through the
 `account.reorder` and `account.setPriority` plugin RPCs.
 
+## Account proxies
+
+Pipe the HTTP or HTTPS proxy URL as one line. Use **Set proxy…** in account
+settings, the `account.setProxy` RPC, or the CLI:
+
+```sh
+printf '%s\n' "$ACCOUNT_PROXY_URL" | bb pool account proxy <id> --proxy-stdin
+bb pool account proxy <id> --off
+printf '%s\n' "$ACCOUNT_PROXY_URL" | bb pool account add --provider claude --login --proxy-stdin
+```
+
+The sign-in command also accepts `--provider codex`. For an Anthropic API key,
+add the account with `--api-key-stdin` and set its proxy in a second command.
+The CLI accepts one stdin secret per command. Keep proxy URLs and their
+credentials out of command arguments and chat. In settings, either sign-in
+flow and API-key add have a **Proxy (optional)** field. Supply the proxy
+username and password together if the proxy requires credentials.
+
+The account proxy overrides proxy environment variables for that account's
+provider requests, token refresh, usage, profile, and sign-in requests made
+by bb. The browser sign-in page opens in your browser. The proxy stays set
+through token refresh and sign-in again. Account list and status show only
+the scheme and host (including a non-default port). If the saved proxy file
+is unreadable, the pool skips the account during routing, refresh, and usage
+checks, and shows `unreadable`. Routing resumes when the file becomes readable.
+A rollback to a build without per-account proxies ignores the setting and sends
+traffic directly. Before rolling back, remove per-account proxies with
+`bb pool account proxy <id> --off`.
+
 ## Nested bb servers
 
 A bb server started from inside another bb server's thread inherits that parent's

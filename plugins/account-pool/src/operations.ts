@@ -78,7 +78,7 @@ export class PoolOperations {
     ) => Promise<PoolProviderState[]>,
     private readonly now: () => number = Date.now,
     private readonly onAccountsChanged: () => void = () => {},
-    private readonly onAccountEnabled: (
+    private readonly refreshEnabledAccountUsage: (
       accountId: string,
     ) => Promise<void> = async () => {},
     private readonly parentStatus: () => Promise<
@@ -100,19 +100,11 @@ export class PoolOperations {
         priority: input.priority,
       },
       { kind: "api-key", apiKey: input.apiKey },
+      input.proxy ?? null,
     );
     this.onAccountsChanged();
-    await this.onAccountEnabled(account.id);
+    await this.refreshEnabledAccountUsage(account.id);
     return account;
-  }
-
-  async validateLoginTarget(
-    provider: PoolProvider,
-    target: LoginTarget,
-  ): Promise<void> {
-    if (target.kind === "relogin") {
-      await this.reloginAccount(provider, target.accountId);
-    }
   }
 
   async addOAuth(
@@ -192,9 +184,10 @@ export class PoolOperations {
         priority: target.priority,
       },
       login.secret,
+      target.proxy ?? null,
     );
     this.onAccountsChanged();
-    await this.onAccountEnabled(account.id);
+    await this.refreshEnabledAccountUsage(account.id);
     return account;
   }
 
@@ -211,11 +204,11 @@ export class PoolOperations {
     }
     await this.hub.replaceSecret(account.id, login.secret);
     this.onAccountsChanged();
-    if (updated.enabled) await this.onAccountEnabled(updated.id);
+    if (updated.enabled) await this.refreshEnabledAccountUsage(updated.id);
     return updated;
   }
 
-  private async reloginAccount(
+  async reloginAccount(
     provider: PoolProvider,
     accountId: string,
   ): Promise<Account> {
@@ -255,7 +248,7 @@ export class PoolOperations {
     const quota = this.quotas.get(id);
     this.quotas.put({ ...quota, error: null, heldUntil: null });
     this.onAccountsChanged();
-    await this.onAccountEnabled(account.id);
+    await this.refreshEnabledAccountUsage(account.id);
     return account;
   }
 
@@ -263,6 +256,16 @@ export class PoolOperations {
     const account = await this.accounts.setEnabled(id, false);
     if (account !== null) this.onAccountsChanged();
     return account;
+  }
+
+  async setProxy(
+    id: string,
+    proxy: string | null,
+  ): Promise<AccountSummary | null> {
+    if (!(await this.accounts.writeProxy(id, proxy))) return null;
+    this.onAccountsChanged();
+    await this.refreshEnabledAccountUsage(id);
+    return (await this.list()).find((account) => account.id === id) ?? null;
   }
 
   async setPriority(id: string, priority: number): Promise<Account | null> {

@@ -31,7 +31,7 @@ import {
 } from "./contracts.js";
 import { z } from "zod";
 import { PARENT_TOKEN_ENV, PARENT_URL_ENV } from "./parent-pool.js";
-import { AccountStore, HubTokenStore } from "./store.js";
+import { AccountStore, HubTokenStore, QuotaStore } from "./store.js";
 import {
   createAccountPoolPlugin,
   helloResponse,
@@ -144,6 +144,7 @@ beforeEach(() => {
 
 afterEach(async () => {
   vi.unstubAllEnvs();
+  vi.unstubAllGlobals();
   while (cleanups.length > 0) await cleanups.pop()?.();
 });
 
@@ -495,6 +496,315 @@ describe("Account Pool config schema", () => {
 });
 
 describe("Account Pool plugin", () => {
+  it("sets an account proxy through RPC and the materialized CLI stdin option, then removes it with --off", async () => {
+    const proxy = "https://user:pass@proxy.invalid:3128";
+    const { host, account } = await createFixture({
+      upstreamUrl: "https://upstream.invalid",
+      options: { fetch: async () => new Response(null, { status: 204 }) },
+    });
+    const harness = host.harness.behavior;
+    const rpcResult = await harness.callRpc("account.setProxy", {
+      id: account.id,
+      proxy: `${proxy}/`,
+    });
+    expect(rpcResult).toMatchObject({
+      proxy: { scheme: "https", host: "proxy.invalid:3128" },
+      proxyUnreadable: false,
+    });
+    const invalid = harness.callRpc("account.setProxy", {
+      id: account.id,
+      proxy: `${proxy}/private`,
+    });
+    await expect(invalid).rejects.toMatchObject({ code: "invalid_input" });
+    await expect(invalid).rejects.not.toThrow(/user:pass/u);
+
+    const prefix = ["account", "proxy", account.id];
+    const help = await harness.runCli([...prefix, "--help"]);
+    expect(help.stdout).toContain("--proxy-stdin");
+    expect(help.stdout).toContain("Unsafe: exposes the proxy URL");
+    const addHelp = await harness.runCli(["account", "add", "--help"]);
+    expect(addHelp.stdout).toContain("--proxy-stdin");
+    expect(addHelp.stdout).toContain("stdin accepts one secret per command");
+    const stdinMarker = await harness.runCli([...prefix, "--proxy-stdin"]);
+    expect(stdinMarker.stderr).toContain("--proxy-stdin is read by the bb CLI");
+    const set = await harness.runCli([
+      ...prefix,
+      "--proxy",
+      "http://user:pass@other.invalid:8080/",
+      "--json",
+    ]);
+    expect(set.exitCode).toBe(0);
+    expect(JSON.parse(set.stdout)).toMatchObject({
+      account: {
+        proxy: { scheme: "http", host: "other.invalid:8080" },
+        proxyUnreadable: false,
+      },
+    });
+    const list = await harness.runCli(["account", "list"]);
+    const status = await harness.runCli(["status"]);
+    const listJson = await harness.runCli(["account", "list", "--json"]);
+    const statusJson = await harness.runCli(["status", "--json"]);
+    for (const output of [listJson, statusJson])
+      expect(JSON.parse(output.stdout)).toMatchObject({
+        accounts: [
+          {
+            proxy: { scheme: "http", host: "other.invalid:8080" },
+            proxyUnreadable: false,
+          },
+        ],
+      });
+    const listed = await harness.callRpc("account.list", null);
+    const reported = await harness.callRpc("status.get", null);
+    for (const output of [list, status])
+      expect(output.stdout).toContain("http://other.invalid:8080");
+    const both = await harness.runCli([
+      ...prefix,
+      "--proxy",
+      proxy,
+      "--off",
+      "--json",
+    ]);
+    expect(both.exitCode).toBe(1);
+    const neither = await harness.runCli([...prefix, "--json"]);
+    expect(neither.exitCode).toBe(1);
+    const off = await harness.runCli([...prefix, "--off", "--json"]);
+    expect(off.exitCode).toBe(0);
+    expect(JSON.parse(off.stdout)).toMatchObject({
+      account: { proxy: null, proxyUnreadable: false },
+    });
+    const added = await harness.callRpc("account.add", {
+      provider: "claude",
+      apiKey: "sk-another",
+      label: null,
+      priority: 100,
+      proxy,
+    });
+    const addedAccount = accountSchema.parse(added);
+    const store = new AccountStore(
+      host.bb.storage.kv,
+      path.join(host.bb.storage.experimental_directory(), "accounts"),
+    );
+    expect(await store.readProxy(addedAccount.id)).toBe(proxy);
+
+    const stored = await host.bb.storage.kv.get("accounts:v1");
+    expect(z.array(accountSchema).parse(stored)).toHaveLength(2);
+    const serialized = JSON.stringify([
+      rpcResult,
+      listed,
+      reported,
+      added,
+      set,
+      list,
+      status,
+      listJson,
+      statusJson,
+      both,
+      neither,
+      off,
+      stored,
+      host.harness.inspection.realtimeSignals,
+      host.harness.inspection.logEntries,
+    ]);
+    expect(serialized).not.toContain("user:pass");
+    expect(serialized).not.toContain(proxy);
+  });
+
+  it.each([true, false])(
+    "fails closed on a missing proxy file with another account enabled = %s",
+    async (fallback) => {
+      const calls: Array<{ proxy: string | null; apiKey: string | null }> = [];
+      const proxy = "http://user:pass@proxy.invalid:3128";
+      const upstream =
+        (address: string | null): typeof fetch =>
+        async (input, init) => {
+          const request = new Request(input, init);
+          calls.push({
+            proxy: address,
+            apiKey: request.headers.get("x-api-key"),
+          });
+          return Response.json({ id: "response" });
+        };
+      const fixture = await createFixture({
+        upstreamUrl: "https://upstream.invalid",
+        options: { fetch: upstream(null), fetchVia: upstream },
+        priority: 1,
+      });
+      const { host, account, key } = fixture;
+      const harness = host.harness.behavior;
+      const send = () =>
+        harness.fetchHttp("POST", "/v1/messages", {
+          headers: authHeaders(key),
+          body: JSON.stringify({ model: "claude-opus-4-1", messages: [] }),
+        });
+      await harness.callRpc("account.setProxy", { id: account.id, proxy });
+      const before = await send();
+      expect(before.status).toBe(200);
+      await before.text();
+      expect(calls.splice(0)).toEqual([{ proxy, apiKey: "sk-account" }]);
+      if (fallback) await addApiAccount(fixture, "sk-fallback", 2);
+      const dir = path.join(
+        host.bb.storage.experimental_directory(),
+        "accounts",
+      );
+      const file = path.join(dir, `account-${account.id}.proxy.json`);
+      await fs.rm(file);
+      const report = statusSchema.parse(
+        await harness.callRpc("status.get", null),
+      );
+      expect(report.accounts[0]).toMatchObject({
+        proxy: null,
+        proxyUnreadable: true,
+        status: "error",
+      });
+      expect(JSON.stringify(report)).not.toContain("user:pass");
+      expect((await harness.runCli(["account", "list"])).stdout).toContain(
+        "unreadable",
+      );
+
+      expect(await resolveToken(host)).toBe(key);
+      const after = await send();
+      expect(after.status).toBe(fallback ? 200 : 429);
+      expect(await after.text()).toContain(
+        fallback
+          ? "response"
+          : "No Account Pooler account is currently eligible.",
+      );
+      expect(calls.splice(0)).toEqual(
+        fallback ? [{ proxy: null, apiKey: "sk-fallback" }] : [],
+      );
+    },
+  );
+
+  it("recovers routing when the proxy file becomes readable again without enabling the account", async () => {
+    const proxy = "http://user:pass@proxy.invalid:3128";
+    const calls: Array<string | null> = [];
+    const upstream =
+      (address: string | null): typeof fetch =>
+      async () => {
+        calls.push(address);
+        return new Response(null, { status: 204 });
+      };
+    const { host, account, key } = await createFixture({
+      upstreamUrl: "https://upstream.invalid",
+      options: { fetch: upstream(null), fetchVia: upstream, env: {} },
+    });
+    const rpc = host.harness.behavior;
+    const send = () =>
+      rpc.fetchHttp("POST", "/v1/messages", {
+        headers: authHeaders(key),
+        body: JSON.stringify({ model: "claude-opus-4-1", messages: [] }),
+      });
+    await rpc.callRpc("account.setProxy", { id: account.id, proxy });
+    const file = path.join(
+      host.bb.storage.experimental_directory(),
+      "accounts",
+      `account-${account.id}.proxy.json`,
+    );
+    await fs.rename(file, `${file}.saved`);
+    await fs.mkdir(file);
+    expect((await send()).status).toBe(429);
+    expect(calls).toEqual([]);
+    expect(await rpc.callRpc("account.list", null)).toMatchObject([
+      { proxyUnreadable: true, error: null },
+    ]);
+    const quotas = new QuotaStore(host.bb.storage.database());
+    expect(quotas.get(account.id).error).toBeNull();
+
+    await fs.rmdir(file);
+    await fs.rename(`${file}.saved`, file);
+    expect((await send()).status).toBe(204);
+    expect(calls).toEqual([proxy]);
+    expect(await rpc.callRpc("account.list", null)).toMatchObject([
+      { proxyUnreadable: false, error: null },
+    ]);
+  });
+
+  it("keeps only the current proxy agent live through ten changes and closes it on off or removal", async () => {
+    const agents: Array<{ closed: boolean }> = [];
+    vi.stubGlobal(
+      "fetch",
+      async (_input: unknown, init: { dispatcher: { closed: boolean } }) => {
+        agents.push(init.dispatcher);
+        return new Response(null, { status: 204 });
+      },
+    );
+    const { host, account, key } = await createFixture({
+      upstreamUrl: "https://upstream.invalid",
+      options: { env: {} },
+    });
+    const rpc = host.harness.behavior;
+    const setProxy = (proxy: string | null) =>
+      rpc.callRpc("account.setProxy", { id: account.id, proxy });
+    const send = () =>
+      rpc.fetchHttp("POST", "/v1/messages", {
+        headers: authHeaders(key),
+        body: JSON.stringify({ model: "claude-opus-4-1", messages: [] }),
+      });
+
+    for (let index = 0; index <= 10; index++) {
+      await setProxy(`http://user:pass@proxy-${index}.invalid:3128`);
+      expect((await send()).status).toBe(204);
+      expect(agents.filter((agent) => !agent.closed)).toHaveLength(1);
+    }
+    await setProxy(null);
+    expect(agents.every((agent) => agent.closed)).toBe(true);
+
+    await setProxy("http://user:pass@proxy.invalid:3128");
+    expect((await send()).status).toBe(204);
+    await rpc.callRpc("account.remove", { id: account.id });
+    expect(agents.every((agent) => agent.closed)).toBe(true);
+  });
+
+  it("does not send a pending pinned retry after the account is removed", async () => {
+    const proxy = "http://user:pass@proxy.invalid:3128";
+    const calls: Array<string | null> = [];
+    let signalRetry = () => {};
+    const rejected = new Promise<void>((resolve) => {
+      signalRetry = resolve;
+    });
+    const upstream =
+      (address: string | null): typeof fetch =>
+      async () => {
+        calls.push(address);
+        if (calls.length === 2) {
+          signalRetry();
+          return Response.json(
+            {},
+            { status: 503, headers: { "retry-after": "1" } },
+          );
+        }
+        return new Response(null, { status: 204 });
+      };
+    const { host, account, key } = await createFixture({
+      upstreamUrl: "https://upstream.invalid",
+      options: { fetch: upstream(null), fetchVia: upstream, env: {} },
+    });
+    const rpc = host.harness.behavior;
+    const send = () =>
+      rpc.fetchHttp("POST", "/v1/messages", {
+        headers: authHeaders(key),
+        body: JSON.stringify({
+          model: "claude-opus-4-1",
+          messages: [],
+          metadata: {
+            user_id: JSON.stringify({
+              device_id: "device",
+              session_id: "pinned",
+            }),
+          },
+        }),
+      });
+    await rpc.callRpc("account.setProxy", { id: account.id, proxy });
+    expect((await send()).status).toBe(204);
+    const retry = send();
+    await rejected;
+    expect(await rpc.callRpc("account.remove", { id: account.id })).toEqual({
+      removed: true,
+    });
+    expect((await retry).status).toBe(503);
+    expect(calls).toEqual([proxy, proxy]);
+  });
+
   it("removes persisted cache debugging settings while preserving pool configuration across reloads", async () => {
     const dataDir = await mkdtemp(
       path.join(tmpdir(), "bb-account-pool-config-upgrade-"),

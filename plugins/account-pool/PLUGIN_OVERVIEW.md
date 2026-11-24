@@ -14,7 +14,11 @@ The hub serves Anthropic Messages and OpenAI Responses endpoints. Routed provide
 
 The pool waits once on the same account for short temporary rate limits. Longer holds return Retry-After for pinned conversations while new conversations can advance. A model-family limit detours requests for that family without moving the session’s main pin or the provider cursor. Server, overload and connection errors retry a pinned account twice with backoff before failing over. The pool commits a new account after a successful response; failing everywhere keeps the old binding. The current account and pins survive hub restarts; pins expire after 30 idle minutes, and the 4,096 most recent are kept.
 
-The pool uses HTTP/1.1 and honors standard proxy environment variables. Connection failures log error codes without credentials or request contents.
+The pool uses HTTP/1.1 and honors standard proxy environment variables. An
+account's own HTTP(S) proxy takes precedence for upstream requests, token
+refresh, usage, profile, and sign-in requests made by the server. Accounts
+with unreadable proxy settings are skipped. Connection failures log error
+codes without credentials or request contents.
 
 ## Nested bb servers
 
@@ -33,7 +37,7 @@ Experimental: routing, storage, and CLI may change.
 
 ## For agents
 
-`bb pool account add|login|list|remove|enable|disable|priority|reorder`, `bb pool status`, `bb pool routing <claude|codex> [--off]`, `bb pool config`, `bb pool config set`, `bb pool parent [proxy|isolate]`, `bb pool token rotate`, and `bb pool bypass <thread-id>`. Every command takes `--json` and `--help`; `bb pool --help` lists the commands and `bb pool <command> --help` prints its arguments, options, and rules.
+`bb pool account add|login|list|remove|enable|disable|priority|proxy|reorder`, `bb pool status`, `bb pool routing <claude|codex> [--off]`, `bb pool config`, `bb pool config set`, `bb pool parent [proxy|isolate]`, `bb pool token rotate`, and `bb pool bypass <thread-id>`. Every command takes `--json` and `--help`; `bb pool --help` lists the commands and `bb pool <command> --help` prints its arguments, options, and rules.
 
 ## Automatic retries
 

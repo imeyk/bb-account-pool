@@ -20,6 +20,8 @@ import {
   poolAvailabilitySchema,
   type AccountPoolConfigController,
   type PoolProvider,
+  type Account,
+  type LoginTarget,
   type PoolStatus,
 } from "./contracts.js";
 import {
@@ -40,6 +42,7 @@ import {
   ACCOUNT_POOL_CONFIG_CHANGED,
 } from "./realtime.js";
 import {
+  AccountProxyUnreadableError,
   AccountStore,
   HubTokenStore,
   PoolAffinityStore,
@@ -50,6 +53,7 @@ import {
 
 export interface AccountPoolPluginOptions {
   fetch?: typeof fetch;
+  fetchVia?: (proxyUrl: string | null) => typeof fetch;
   now?: () => number;
   env?: NodeJS.ProcessEnv;
   availabilityTtlMs?: number;
@@ -127,7 +131,12 @@ export function createAccountPoolPlugin(
       "secrets",
       "accounts",
     );
-    const accounts = new AccountStore(bb.storage.kv, secretDir);
+    const transport =
+      options.fetch === undefined ? createUpstreamTransport() : null;
+    const forgetProxy = (url: string) => {
+      void transport?.forget(url).catch(() => {});
+    };
+    const accounts = new AccountStore(bb.storage.kv, secretDir, forgetProxy);
     await accounts.initialize();
     const now = options.now ?? Date.now;
     const hubTokens = new HubTokenStore(secretDir, now);
@@ -143,9 +152,17 @@ export function createAccountPoolPlugin(
     const db = bb.storage.database();
     bb.storage.migrate(db, QUOTA_MIGRATIONS);
     const quotas = new QuotaStore(db);
-    const transport =
-      options.fetch === undefined ? createUpstreamTransport() : null;
-    const upstreamFetch = options.fetch ?? transport?.fetch;
+    for (const account of await accounts.list()) {
+      const quota = quotas.get(account.id);
+      if (quota.error === new AccountProxyUnreadableError(account.id).message) {
+        quotas.put({ ...quota, error: null });
+      }
+    }
+    const upstreamFetch = options.fetch ?? transport?.fetch ?? fetch;
+    const fetchVia =
+      options.fetchVia ?? transport?.fetchVia ?? (() => upstreamFetch);
+    const fetchFor = async (account: Account) =>
+      fetchVia(await accounts.readAccountProxy(account.id));
     const hub = createHub({
       accounts,
       quotas,
@@ -153,6 +170,7 @@ export function createAccountPoolPlugin(
       hubTokens,
       getSettings: () => currentSettings,
       fetch: upstreamFetch,
+      fetchFor,
       now,
       refreshUrl: options.refreshUrl,
       codexRefreshUrl: options.codexRefreshUrl,
@@ -185,7 +203,7 @@ export function createAccountPoolPlugin(
         ? null
         : new ParentAvailability({
             parent: parentPool,
-            fetch: upstreamFetch ?? fetch,
+            fetch: upstreamFetch,
             now,
             ...(options.availabilityTtlMs === undefined
               ? {}
@@ -217,23 +235,35 @@ export function createAccountPoolPlugin(
       (accountId) => hub.refreshUsage(accountId, true),
       parentStatus,
     );
+    const fetchForTarget = async (
+      provider: PoolProvider,
+      target: LoginTarget,
+    ): Promise<typeof fetch> => {
+      if (target.kind === "add") {
+        const proxy = target.proxy ?? null;
+        return (input, init) => fetchVia(proxy)(input, init);
+      }
+      const account = await operations.reloginAccount(
+        provider,
+        target.accountId,
+      );
+      return async (input, init) => (await fetchFor(account))(input, init);
+    };
     const login = new ClaudeOAuthLogin({
-      fetch: upstreamFetch,
+      fetchForTarget: (target) => fetchForTarget("claude", target),
+      forgetProxy,
       now,
       authorizeUrl: options.oauthAuthorizeUrl,
       tokenUrl: options.oauthTokenUrl,
       profileUrl: options.oauthProfileUrl,
-      validateTarget: (target) =>
-        operations.validateLoginTarget("claude", target),
       saveLogin: (authenticated, target) =>
         operations.addOAuth(authenticated, target),
     });
     const codexLogin = new CodexDeviceLogin({
-      fetch: upstreamFetch,
+      fetchForTarget: (target) => fetchForTarget("codex", target),
+      forgetProxy,
       now,
       authBaseUrl: options.codexAuthBaseUrl,
-      validateTarget: (target) =>
-        operations.validateLoginTarget("codex", target),
       saveLogin: (authenticated, target) =>
         operations.addCodexOAuth(authenticated, target),
     });
@@ -418,6 +448,7 @@ export function createAccountPoolPlugin(
       proxiedHealth("codex"),
     );
     bb.onDispose(async () => {
+      login.dispose();
       codexLogin.dispose();
       let timer: ReturnType<typeof setTimeout> | null = null;
       try {

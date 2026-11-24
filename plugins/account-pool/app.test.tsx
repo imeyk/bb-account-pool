@@ -82,6 +82,8 @@ function account(overrides: Partial<AccountSummary> = {}): AccountSummary {
     lastUsedAt: 2,
     lastUsedHostId: "host-one",
     lastUsedHostName: "bee",
+    proxy: null,
+    proxyUnreadable: false,
     representativeClaim: null,
     familyWeekly: {
       fable: null,
@@ -230,7 +232,9 @@ describe("Account Pool settings", () => {
   it("renders cached accounts as refreshing until live status arrives, then caches it", async () => {
     window.localStorage.setItem(
       STATUS_CACHE_KEY,
-      JSON.stringify(status([account({ limitWindows: [claudeWindow("primary", 0.21)] })])),
+      JSON.stringify(
+        status([account({ limitWindows: [claudeWindow("primary", 0.21)] })]),
+      ),
     );
     const live = deferred<PoolStatus>();
     const slot = render([], { "status.get": () => live.promise });
@@ -240,7 +244,9 @@ describe("Account Pool settings", () => {
     expect(slot.getByText(/· refreshing…$/)).toBeTruthy();
     expect(slot.queryByText("Loading…")).toBeNull();
     expect(slot.queryByText("No accounts in the pool")).toBeNull();
-    live.resolve(status([account({ limitWindows: [claudeWindow("primary", 0.6)] })]));
+    live.resolve(
+      status([account({ limitWindows: [claudeWindow("primary", 0.6)] })]),
+    );
     expect(await slot.findByText("60%")).toBeTruthy();
     expect(slot.queryByText("refreshing usage…")).toBeNull();
     expect(slot.queryByText(/· refreshing…$/)).toBeNull();
@@ -406,6 +412,63 @@ describe("Account Pool settings", () => {
     },
   );
 
+  it("shows the public proxy address in account details and saves a replacement", async () => {
+    const current = account({
+      proxy: { scheme: "https", host: "proxy.invalid:3128" },
+    });
+    const slot = render([current], { "account.setProxy": () => current });
+    fireEvent.click(
+      await slot.findByRole("button", {
+        name: "Open person@example.com details",
+      }),
+    );
+    expect(await slot.findByText("https://proxy.invalid:3128")).toBeTruthy();
+    fireEvent.click(slot.getByRole("button", { name: "Close" }));
+    fireEvent.pointerDown(
+      await slot.findByRole("button", { name: "person@example.com actions" }),
+    );
+    fireEvent.click(await slot.findByText("Set proxy…"));
+    const input = await slot.findByLabelText("Proxy address");
+    expect(input).toHaveProperty("value", "");
+    const proxy = "http://user:pass@proxy.invalid:8080";
+    fireEvent.change(input, { target: { value: proxy } });
+    fireEvent.click(slot.getByRole("button", { name: "Save" }));
+    expect(slot.rpcCalls).toContainEqual({
+      method: "account.setProxy",
+      input: { id: current.id, proxy },
+    });
+    await waitFor(() =>
+      expect(slot.queryByRole("dialog", { name: "Set proxy" })).toBeNull(),
+    );
+  });
+
+  it("shows an unreadable proxy and removes it from the compact drawer", async () => {
+    mockCompactViewport(true);
+    const current = account({ proxyUnreadable: true });
+    const slot = render([current], { "account.setProxy": () => account() });
+    const details = await slot.findByRole("button", {
+      name: "Open person@example.com details",
+    });
+    fireEvent.click(details);
+    expect(await slot.findByText("unreadable")).toBeTruthy();
+    fireEvent.click(slot.getByRole("button", { name: "Close" }));
+    const actions = await slot.findByRole("button", {
+      name: "person@example.com actions",
+    });
+    fireEvent.click(actions);
+    fireEvent.click(await slot.findByText("Set proxy…"));
+    expect(await slot.findByLabelText("Proxy address")).toHaveProperty(
+      "value",
+      "",
+    );
+    expect(actions.closest('[inert], [aria-hidden="true"]')).toBeNull();
+    fireEvent.click(slot.getByRole("button", { name: "Remove proxy" }));
+    expect(slot.rpcCalls).toContainEqual({
+      method: "account.setProxy",
+      input: { id: current.id, proxy: null },
+    });
+  });
+
   it("confirms Remove before dispatching its RPC contract", async () => {
     const slot = render([account()], {
       "account.remove": () => ({ removed: true }),
@@ -446,6 +509,19 @@ describe("Account Pool settings", () => {
     fireEvent.click(
       await slot.findByText("Sign in to Claude", { selector: "span.block" }),
     );
+    fireEvent.change(await slot.findByLabelText("Proxy (optional)"), {
+      target: { value: "http://user:pass@proxy.invalid:3128" },
+    });
+    fireEvent.click(slot.getByRole("button", { name: "Continue" }));
+    expect(slot.rpcCalls).toContainEqual({
+      method: "login.start",
+      input: {
+        kind: "add",
+        label: null,
+        priority: 100,
+        proxy: "http://user:pass@proxy.invalid:3128",
+      },
+    });
     expect(
       await slot.findByLabelText("Claude authorization code"),
     ).toBeTruthy();
@@ -454,6 +530,7 @@ describe("Account Pool settings", () => {
     fireEvent.click(
       await slot.findByText("Sign in to Codex", { selector: "span.block" }),
     );
+    fireEvent.click(await slot.findByRole("button", { name: "Continue" }));
     expect(
       (await slot.findByLabelText("Codex user code")).textContent,
     ).toContain("ABCD-1234");
@@ -642,6 +719,7 @@ describe("Account Pool settings", () => {
     fireEvent.click(
       await slot.findByRole("button", { name: "Sign in to Codex" }),
     );
+    fireEvent.click(await slot.findByRole("button", { name: "Continue" }));
     const dialog = await slot.findByRole("dialog", {
       name: "Sign in to Codex",
     });
@@ -669,7 +747,8 @@ describe("Account Pool settings", () => {
       fireEvent.click(
         await slot.findByRole("button", { name: "Sign in to Codex" }),
       );
-      await slot.findByRole("dialog", { name: "Sign in to Codex" });
+      fireEvent.click(await slot.findByRole("button", { name: "Continue" }));
+      await slot.findByLabelText("Codex user code");
       fireEvent.click(slot.getByRole("button", { name: "Close" }));
       await waitFor(() =>
         expect(slot.rpcCalls).toContainEqual({
@@ -701,6 +780,7 @@ describe("Account Pool settings", () => {
     fireEvent.click(
       await slot.findByRole("button", { name: "Sign in to Codex" }),
     );
+    fireEvent.click(await slot.findByRole("button", { name: "Continue" }));
     const button = await slot.findByRole("button", {
       name: "Copy Codex sign-in code",
     });
@@ -724,6 +804,7 @@ describe("Account Pool settings", () => {
     fireEvent.click(
       await slot.findByRole("button", { name: "Sign in to Codex" }),
     );
+    fireEvent.click(await slot.findByRole("button", { name: "Continue" }));
     const button = await slot.findByRole("button", {
       name: "Copy Codex authorization URL",
     });
@@ -755,6 +836,7 @@ describe("Account Pool settings", () => {
     fireEvent.click(
       await slot.findByRole("button", { name: "Sign in to Codex" }),
     );
+    fireEvent.click(await slot.findByRole("button", { name: "Continue" }));
     fireEvent.click(
       await slot.findByRole("button", { name: "Copy Codex sign-in code" }),
     );
@@ -793,6 +875,7 @@ describe("Account Pool settings", () => {
     fireEvent.click(
       await slot.findByRole("button", { name: "Sign in to Codex" }),
     );
+    fireEvent.click(await slot.findByRole("button", { name: "Continue" }));
     fireEvent.click(await slot.findByRole("button", { name: "Start again" }));
     await waitFor(() => expect(starts).toBe(2));
   });

@@ -8,6 +8,7 @@ import {
   accountPriorityInputSchema,
   accountReorderInputSchema,
   accountSchema,
+  accountSetProxyInputSchema,
   accountSummarySchema,
   bypassInputSchema,
   codexLoginCancelSchema,
@@ -48,6 +49,10 @@ export const accountPoolRpcContract = defineRpcContract({
   "account.disable": {
     input: accountIdInputSchema,
     output: z.object({ account: accountSchema.nullable() }).strict(),
+  },
+  "account.setProxy": {
+    input: accountSetProxyInputSchema,
+    output: accountSummarySchema.nullable(),
   },
   "account.setPriority": {
     input: accountPriorityInputSchema,
@@ -131,6 +136,7 @@ export function createRpcHandlers(
     "account.disable": async ({ id }) => ({
       account: await operations.disable(id),
     }),
+    "account.setProxy": ({ id, proxy }) => operations.setProxy(id, proxy),
     "account.setPriority": async ({ accountId, priority }) => ({
       account: await operations.setPriority(accountId, priority),
     }),

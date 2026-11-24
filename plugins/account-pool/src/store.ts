@@ -15,6 +15,7 @@ import {
   EMPTY_FAMILY_WEEKLY,
   hubTokenSummarySchema,
   providerSchema,
+  proxyUrlSchema,
   quotaSchema,
   type Account,
   type AccountQuota,
@@ -24,8 +25,13 @@ import {
 } from "./contracts.js";
 
 const ACCOUNTS_KEY = "accounts:v1";
+const ACCOUNT_PROXIES_KEY = "account-proxies:v1";
+const accountProxyIdsSchema = z
+  .array(z.string().uuid())
+  .refine((ids) => new Set(ids).size === ids.length);
 const ACCOUNT_LAST_USED_PERSIST_MS = 60 * 1_000;
 const accountsSchema = z.array(accountSchema);
+const accountProxySchema = z.object({ url: proxyUrlSchema }).strict();
 const HUB_TOKEN_PREFIX = "hub-token-";
 const HUB_TOKEN_GRACE_MS = 10 * 60 * 1_000;
 const HUB_TOKEN_LAST_USED_PERSIST_MS = 60 * 1_000;
@@ -74,12 +80,31 @@ export type RoutedThread = z.infer<typeof routedThreadSchema> & {
   threadId: string;
 };
 
+export class AccountRemovedError extends Error {
+  constructor() {
+    super("account removed");
+  }
+}
+
+export class AccountProxyUnreadableError extends Error {
+  constructor(id: string) {
+    super(`Account ${id} proxy is unreadable.`);
+    this.name = "AccountProxyUnreadableError";
+  }
+}
+
+function fileMissing(error: unknown): boolean {
+  return error instanceof Error && "code" in error && error.code === "ENOENT";
+}
+
 export class AccountStore {
   private mutationLock: Promise<void> | null = null;
+  private readonly knownProxies = new Map<string, string>();
 
   constructor(
     private readonly kv: PluginKvStorage,
     private readonly secretsDir: string,
+    private readonly forgetProxy: (url: string) => void = () => {},
   ) {}
 
   async initialize(): Promise<void> {
@@ -100,6 +125,7 @@ export class AccountStore {
   async add(
     input: Omit<Account, "id" | "createdAt" | "lastUsedAt" | "lastUsedHostId">,
     secret: AccountSecret,
+    proxy: string | null = null,
   ): Promise<Account> {
     return this.serialized(async () => {
       const account = accountSchema.parse({
@@ -111,11 +137,15 @@ export class AccountStore {
       });
       await this.writeSecret(account.id, secret);
       try {
+        if (proxy !== null) await this.saveProxy(account.id, proxy);
         const accounts = await this.list();
         accounts.push(account);
         await this.kv.set(ACCOUNTS_KEY, accounts);
       } catch (error) {
-        await fs.rm(this.accountSecretPath(account.id), { force: true });
+        await Promise.all([
+          fs.rm(this.accountSecretPath(account.id), { force: true }),
+          this.saveProxy(account.id, null),
+        ]);
         throw error;
       }
       return account;
@@ -127,9 +157,17 @@ export class AccountStore {
       const accounts = await this.list();
       const next = accounts.filter((account) => account.id !== id);
       if (next.length === accounts.length) return false;
-      await this.kv.set(ACCOUNTS_KEY, next);
+      const previousProxy = await this.proxyBeforeMutation(id);
+      const proxyFile = this.accountProxyPath(id);
+      if (await this.proxyFileExists(proxyFile))
+        await this.setProxyPresence(id, true);
+      await fs.rm(proxyFile, { force: true });
+      this.knownProxies.delete(id);
+      if (previousProxy !== null) this.forgetProxy(previousProxy);
       await fs.rm(this.accountSecretPath(id), { force: true });
       await this.kv.delete(this.rejectedRefreshKey(id));
+      await this.kv.set(ACCOUNTS_KEY, next);
+      await this.setProxyPresence(id, false);
       return true;
     });
   }
@@ -251,13 +289,130 @@ export class AccountStore {
   }
 
   async writeSecret(id: string, secret: AccountSecret): Promise<void> {
+    await this.writeSecretFile(
+      this.accountSecretPath(id),
+      accountSecretSchema.parse(secret),
+    );
+  }
+
+  async readProxy(id: string): Promise<string | null> {
+    try {
+      if ((await this.proxyIds()).includes(id))
+        return await this.readProxyFile(this.accountProxyPath(id));
+    } catch {
+      throw new AccountProxyUnreadableError(id);
+    }
+    return this.serialized(() => this.loadProxy(id));
+  }
+
+  async readAccountProxy(id: string): Promise<string | null> {
+    return this.serialized(async () => {
+      if ((await this.get(id)) === null) throw new AccountRemovedError();
+      return this.loadProxy(id);
+    });
+  }
+
+  private async proxyIds(): Promise<string[]> {
+    const value = await this.kv.get(ACCOUNT_PROXIES_KEY);
+    return value === undefined ? [] : accountProxyIdsSchema.parse(value);
+  }
+
+  private async setProxyPresence(id: string, present: boolean): Promise<void> {
+    const ids = await this.proxyIds();
+    if (ids.includes(id) === present) return;
+    await this.kv.set(
+      ACCOUNT_PROXIES_KEY,
+      present ? [...ids, id] : ids.filter((candidate) => candidate !== id),
+    );
+  }
+
+  private async loadProxy(id: string): Promise<string | null> {
+    try {
+      const file = this.accountProxyPath(id);
+      if (!(await this.proxyIds()).includes(id)) {
+        if (!(await this.proxyFileExists(file))) return null;
+        await this.setProxyPresence(id, true);
+      }
+      const url = await this.readProxyFile(file);
+      const previous = this.knownProxies.get(id);
+      if (previous !== undefined && previous !== url)
+        this.forgetProxy(previous);
+      this.knownProxies.set(id, url);
+      return url;
+    } catch {
+      throw new AccountProxyUnreadableError(id);
+    }
+  }
+
+  private async proxyFileExists(file: string): Promise<boolean> {
+    try {
+      await fs.lstat(file);
+      return true;
+    } catch (error) {
+      if (fileMissing(error)) return false;
+      throw error;
+    }
+  }
+
+  private async readProxyFile(file: string): Promise<string> {
+    return accountProxySchema.parse(JSON.parse(await fs.readFile(file, "utf8")))
+      .url;
+  }
+
+  private async proxyBeforeMutation(id: string): Promise<string | null> {
+    const known = this.knownProxies.get(id);
+    if (known !== undefined) return known;
+    try {
+      return await this.readProxyFile(this.accountProxyPath(id));
+    } catch {
+      return null;
+    }
+  }
+
+  async writeProxy(id: string, url: string | null): Promise<boolean> {
+    return this.serialized(async () => {
+      if ((await this.get(id)) === null) return false;
+      const previous = await this.proxyBeforeMutation(id);
+      const saved = await this.saveProxy(id, url);
+      if (previous !== null && previous !== saved) this.forgetProxy(previous);
+      return true;
+    });
+  }
+
+  private async saveProxy(
+    id: string,
+    url: string | null,
+  ): Promise<string | null> {
+    const destination = this.accountProxyPath(id);
+    if (url === null) {
+      await this.setProxyPresence(id, false);
+      await fs.rm(destination, { force: true });
+      this.knownProxies.delete(id);
+      return null;
+    }
+    const proxy = accountProxySchema.parse({ url });
+    await this.writeSecretFile(destination, proxy);
+    await this.setProxyPresence(id, true);
+    this.knownProxies.set(id, proxy.url);
+    return proxy.url;
+  }
+
+  private async writeSecretFile(
+    destination: string,
+    value: object,
+  ): Promise<void> {
     await this.initialize();
-    const value = `${JSON.stringify(accountSecretSchema.parse(secret))}\n`;
-    const destination = this.accountSecretPath(id);
     const temporary = `${destination}.${randomUUID()}.tmp`;
-    await fs.writeFile(temporary, value, { encoding: "utf8", mode: 0o600 });
-    await fs.rename(temporary, destination);
-    await fs.chmod(destination, 0o600);
+    try {
+      await fs.writeFile(temporary, `${JSON.stringify(value)}\n`, {
+        encoding: "utf8",
+        mode: 0o600,
+      });
+      await fs.chmod(temporary, 0o600);
+      await fs.rename(temporary, destination);
+    } finally {
+      await fs.rm(temporary, { force: true });
+    }
   }
 
   async rejectedRefresh(
@@ -298,6 +453,11 @@ export class AccountStore {
   private accountSecretPath(id: string): string {
     z.string().uuid().parse(id);
     return path.join(this.secretsDir, `account-${id}.json`);
+  }
+
+  private accountProxyPath(id: string): string {
+    z.string().uuid().parse(id);
+    return path.join(this.secretsDir, `account-${id}.proxy.json`);
   }
 
   private async serialized<T>(action: () => Promise<T>): Promise<T> {
