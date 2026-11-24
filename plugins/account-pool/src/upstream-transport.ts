@@ -1,4 +1,9 @@
-import { EnvHttpProxyAgent, ProxyAgent, type Dispatcher } from "undici";
+import {
+  EnvHttpProxyAgent,
+  ProxyAgent,
+  Socks5ProxyAgent,
+  type Dispatcher,
+} from "undici";
 
 function fetchWithDispatcher(dispatcher: Dispatcher): typeof fetch {
   return (input, init) => {
@@ -10,8 +15,8 @@ function fetchWithDispatcher(dispatcher: Dispatcher): typeof fetch {
 export function createUpstreamTransport() {
   const dispatcher = new EnvHttpProxyAgent({ allowH2: false });
   const upstreamFetch = fetchWithDispatcher(dispatcher);
-  const proxies = new Map<string, { agent: ProxyAgent; fetch: typeof fetch }>();
-  const closing = new Set<ProxyAgent>();
+  const proxies = new Map<string, { agent: Dispatcher; fetch: typeof fetch }>();
+  const closing = new Set<Dispatcher>();
   let destroyed = false;
   return {
     fetch: upstreamFetch,
@@ -20,9 +25,15 @@ export function createUpstreamTransport() {
       const existing = proxies.get(proxyUrl);
       if (existing !== undefined) return existing.fetch;
       if (destroyed) throw new Error("Account Pooler transport is closed.");
-      let agent: ProxyAgent;
+      let agent: Dispatcher;
       try {
-        agent = new ProxyAgent({ uri: proxyUrl, allowH2: false });
+        const url = new URL(proxyUrl);
+        if (url.protocol === "socks5:" || url.protocol === "socks5h:") {
+          url.protocol = "socks5:";
+          agent = new Socks5ProxyAgent(url);
+        } else {
+          agent = new ProxyAgent({ uri: proxyUrl, allowH2: false });
+        }
       } catch {
         return async () => {
           throw new Error(

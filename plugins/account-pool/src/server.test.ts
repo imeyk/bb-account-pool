@@ -521,22 +521,24 @@ describe("Account Pool plugin", () => {
     const prefix = ["account", "proxy", account.id];
     const help = await harness.runCli([...prefix, "--help"]);
     expect(help.stdout).toContain("--proxy-stdin");
+    expect(help.stdout).toContain("http://, https:// or socks5://");
     expect(help.stdout).toContain("Unsafe: exposes the proxy URL");
     const addHelp = await harness.runCli(["account", "add", "--help"]);
     expect(addHelp.stdout).toContain("--proxy-stdin");
     expect(addHelp.stdout).toContain("stdin accepts one secret per command");
     const stdinMarker = await harness.runCli([...prefix, "--proxy-stdin"]);
     expect(stdinMarker.stderr).toContain("--proxy-stdin is read by the bb CLI");
+    const socksProxy = "socks5://user:pass@other.invalid:1080/";
     const set = await harness.runCli([
       ...prefix,
       "--proxy",
-      "http://user:pass@other.invalid:8080/",
+      socksProxy,
       "--json",
     ]);
     expect(set.exitCode).toBe(0);
     expect(JSON.parse(set.stdout)).toMatchObject({
       account: {
-        proxy: { scheme: "http", host: "other.invalid:8080" },
+        proxy: { scheme: "socks5", host: "other.invalid:1080" },
         proxyUnreadable: false,
       },
     });
@@ -548,15 +550,18 @@ describe("Account Pool plugin", () => {
       expect(JSON.parse(output.stdout)).toMatchObject({
         accounts: [
           {
-            proxy: { scheme: "http", host: "other.invalid:8080" },
+            proxy: { scheme: "socks5", host: "other.invalid:1080" },
             proxyUnreadable: false,
           },
         ],
       });
     const listed = await harness.callRpc("account.list", null);
     const reported = await harness.callRpc("status.get", null);
+    expect(reported).toMatchObject({
+      accounts: [{ proxy: { scheme: "socks5", host: "other.invalid:1080" } }],
+    });
     for (const output of [list, status])
-      expect(output.stdout).toContain("http://other.invalid:8080");
+      expect(output.stdout).toContain("socks5://other.invalid:1080");
     const both = await harness.runCli([
       ...prefix,
       "--proxy",
@@ -607,6 +612,7 @@ describe("Account Pool plugin", () => {
     ]);
     expect(serialized).not.toContain("user:pass");
     expect(serialized).not.toContain(proxy);
+    expect(serialized).not.toContain(socksProxy.slice(0, -1));
   });
 
   it.each([true, false])(

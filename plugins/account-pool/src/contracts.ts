@@ -16,6 +16,8 @@ const httpUrlSchema = z.string().refine((value) => {
   }
 }, "Must be an HTTP or HTTPS URL.");
 
+export const proxySchemeSchema = z.enum(["http", "https", "socks5", "socks5h"]);
+
 export const proxyUrlSchema = z
   .string()
   .min(1)
@@ -25,22 +27,25 @@ export const proxyUrlSchema = z
     let url: URL | null = null;
     try {
       url = new URL(value);
+      if (url.protocol === "socks5:" || url.protocol === "socks5h:") {
+        url.hostname = new URL(`http://${url.hostname}`).hostname;
+      }
     } catch {
       url = null;
     }
     if (
       url === null ||
-      (url.protocol !== "http:" && url.protocol !== "https:") ||
+      !proxySchemeSchema.safeParse(url.protocol.slice(0, -1)).success ||
       url.hostname === "" ||
       (url.pathname !== "" && url.pathname !== "/") ||
-      !/^https?:[\\/]*[^\\/]+\/?$/iu.test(value) ||
+      !/^(?:https?:[\\/]*|socks5h?:\/\/)[^\\/]+\/?$/iu.test(value) ||
       url.href.includes("?") ||
       url.href.includes("#")
     ) {
       ctx.addIssue({
         code: "custom",
         message:
-          "Enter an HTTP or HTTPS proxy URL without a path, query, or fragment.",
+          "Enter a proxy URL with http://, https:// or socks5:// and no path, query, or fragment.",
       });
       return z.NEVER;
     }
@@ -68,7 +73,7 @@ export const proxyUrlSchema = z
       });
       return z.NEVER;
     }
-    return url.href.slice(0, -1);
+    return url.href.replace(/\/$/u, "");
   })
   .pipe(z.string().max(2048));
 
@@ -265,7 +270,7 @@ export type AccountQuota = z.infer<typeof quotaSchema>;
 export const accountSummarySchema = accountSchema.extend({
   lastUsedHostName: z.string().min(1).nullable(),
   proxy: z
-    .object({ scheme: z.enum(["http", "https"]), host: z.string().min(1) })
+    .object({ scheme: proxySchemeSchema, host: z.string().min(1) })
     .strict()
     .nullable(),
   proxyUnreadable: z.boolean(),

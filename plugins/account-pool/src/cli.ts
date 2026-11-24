@@ -53,7 +53,7 @@ const PROXY_OPTION = {
   type: "string",
   stdin: true,
   description:
-    "Account HTTP(S) proxy URL. Use --proxy-stdin. Unsafe: exposes the proxy URL in process arguments, shell history, and agent transcripts when passed as an argument",
+    "Account proxy URL (http://, https:// or socks5://). Use --proxy-stdin. Unsafe: exposes the proxy URL in process arguments, shell history, and agent transcripts when passed as an argument",
 } as const;
 
 const PROVIDER_OPTION = {

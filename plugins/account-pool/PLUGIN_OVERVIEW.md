@@ -15,10 +15,16 @@ The hub serves Anthropic Messages and OpenAI Responses endpoints. Routed provide
 The pool waits once on the same account for short temporary rate limits. Longer holds return Retry-After for pinned conversations while new conversations can advance. A model-family limit detours requests for that family without moving the session’s main pin or the provider cursor. Server, overload and connection errors retry a pinned account twice with backoff before failing over. The pool commits a new account after a successful response; failing everywhere keeps the old binding. The current account and pins survive hub restarts; pins expire after 30 idle minutes, and the 4,096 most recent are kept.
 
 The pool uses HTTP/1.1 and honors standard proxy environment variables. An
-account's own HTTP(S) proxy takes precedence for upstream requests, token
+account's own HTTP(S) or SOCKS5 proxy takes precedence for upstream requests, token
 refresh, usage, profile, and sign-in requests made by the server. Accounts
 with unreadable proxy settings are skipped. Connection failures log error
 codes without credentials or request contents.
+
+Both `socks5://` and `socks5h://` use undici's experimental
+`Socks5ProxyAgent` and send destination hostnames to the proxy for DNS
+resolution. Node emits an `ExperimentalWarning` on the first use of the
+agent in each process. Supply the proxy username and password together if
+the proxy requires credentials.
 
 ## Nested bb servers
 

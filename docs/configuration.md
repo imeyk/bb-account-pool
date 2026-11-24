@@ -1302,7 +1302,7 @@ account-pool`), except that a nested server with `BB_ACCOUNT_POOL_PARENT_URL`
 enables it. Account tokens and per-machine hub tokens are 0600 files under
 `<dataDir>/plugins/account-pool/secrets/accounts/`.
 
-Optional per-account HTTP(S) proxies are stored in
+Optional per-account HTTP(S) and SOCKS5 proxies are stored in
 `account-<id>.proxy.json` in the same directory with file mode `0600`.
 An account's proxy takes precedence over proxy environment variables for its
 upstream, token, usage, profile, and server-side sign-in requests. If the
@@ -1310,7 +1310,10 @@ proxy file is unreadable, the pool skips the account. Accounts without a
 proxy and traffic to a parent pool follow the proxy environment variables.
 Use `bb pool account proxy <id> --proxy-stdin` to set a proxy from stdin or
 `bb pool account proxy <id> --off` to remove it. Supply the proxy username
-and password together if the proxy requires credentials. A rollback to a build
+and password together if the proxy requires credentials. Both `socks5://` and
+`socks5h://` use undici's experimental `Socks5ProxyAgent` and send destination
+hostnames to the proxy for DNS resolution. Node emits an `ExperimentalWarning`
+on the first use of the agent in each process. A rollback to a build
 without per-account proxies ignores the setting and sends traffic directly.
 Before rolling back, remove per-account proxies with
 `bb pool account proxy <id> --off`.

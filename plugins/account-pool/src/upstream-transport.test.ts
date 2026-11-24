@@ -88,6 +88,99 @@ async function connectProxy(target: URL) {
   return { url: `http://user:pass@127.0.0.1:${address.port}`, connections };
 }
 
+async function socks5Proxy(target: URL, authenticate = false) {
+  const connections: Array<{ host: string; port: number }> = [];
+  const credentials: Array<{ username: string; password: string }> = [];
+  const clients = new Set<net.Socket>();
+  const server = net.createServer((client) => {
+    clients.add(client);
+    const closed = new AbortController();
+    client.on("close", () => {
+      closed.abort();
+      clients.delete(client);
+    });
+    client.on("error", () => client.destroy());
+
+    const read = async (length: number): Promise<Buffer> => {
+      let bytes: Buffer | null = client.read(length);
+      while (bytes === null) {
+        await once(client, "readable", { signal: closed.signal });
+        bytes = client.read(length);
+      }
+      return bytes;
+    };
+
+    const negotiate = async () => {
+      const [version, methodCount] = await read(2);
+      const methods = await read(methodCount);
+      const method = authenticate ? 2 : 0;
+      if (version !== 5 || !methods.includes(method)) {
+        client.end(Buffer.from([5, 255]));
+        return;
+      }
+      client.write(Buffer.from([5, method]));
+
+      if (authenticate) {
+        const [authVersion, usernameLength] = await read(2);
+        const username = (await read(usernameLength)).toString();
+        const [passwordLength] = await read(1);
+        const password = (await read(passwordLength)).toString();
+        credentials.push({ username, password });
+        if (authVersion !== 1 || username !== "u" || password !== "p") {
+          client.end(Buffer.from([1, 1]));
+          return;
+        }
+        client.write(Buffer.from([1, 0]));
+      }
+
+      const [requestVersion, command, reserved, addressType] = await read(4);
+      const reply = Buffer.from([5, 0, 0, 1, 127, 0, 0, 1, 0, 0]);
+      if (
+        requestVersion !== 5 ||
+        command !== 1 ||
+        reserved !== 0 ||
+        (addressType !== 1 && addressType !== 3)
+      ) {
+        reply[1] = 7;
+        client.end(reply);
+        return;
+      }
+      const host =
+        addressType === 1
+          ? (await read(4)).join(".")
+          : (await read((await read(1))[0])).toString();
+      const port = (await read(2)).readUInt16BE();
+      connections.push({ host, port });
+      if (
+        (host !== target.hostname && host !== "upstream.invalid") ||
+        port !== Number(target.port)
+      ) {
+        reply[1] = 4;
+        client.end(reply);
+        return;
+      }
+      const upstream = net.connect(port, target.hostname, () => {
+        client.write(reply);
+        client.pipe(upstream).pipe(client);
+      });
+      upstream.on("error", () => client.destroy());
+      client.on("close", () => upstream.destroy());
+    };
+
+    void negotiate().catch(() => client.destroy());
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  cleanups.push(async () => {
+    for (const client of clients) client.destroy();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+  const address = server.address();
+  if (address === null || typeof address === "string")
+    throw new Error("No proxy port");
+  return { host: `127.0.0.1:${address.port}`, connections, credentials };
+}
+
 it("routes an account through a CONNECT proxy and bypasses it for the default transport", async () => {
   const target = await upstream();
   const targetUrl = new URL(target.url);
@@ -115,6 +208,68 @@ it("routes an account through a CONNECT proxy and bypasses it for the default tr
   expect(target.requests()).toBe(3);
 });
 
+it.each(["socks5", "socks5h"])(
+  "routes requests through %s, sends the destination hostname, and closes the forgotten agent",
+  async (scheme) => {
+    const target = await upstream();
+    const targetUrl = new URL(target.url);
+    const proxy = await socks5Proxy(targetUrl);
+    const transport = createUpstreamTransport();
+    cleanups.push(transport.destroy);
+    const url = `${scheme}://${proxy.host}`;
+    const routed = transport.fetchVia(url);
+    const namedTarget = new URL(target.url);
+    namedTarget.hostname = "upstream.invalid";
+    const init = { signal: AbortSignal.timeout(3_000) };
+
+    expect(
+      await (await transport.fetchVia(null)(target.url, init)).text(),
+    ).toBe("OK");
+    expect(proxy.connections).toEqual([]);
+    expect(await (await routed(target.url, init)).text()).toBe("OK");
+    expect(await (await routed(namedTarget, init)).text()).toBe("OK");
+    await transport.forget(url);
+    await expect(routed(target.url, init)).rejects.toMatchObject({
+      code: "UND_ERR_DESTROYED",
+    });
+    expect(await (await transport.fetchVia(url)(target.url, init)).text()).toBe(
+      "OK",
+    );
+    expect(proxy.connections).toEqual([
+      { host: targetUrl.hostname, port: Number(targetUrl.port) },
+      { host: namedTarget.hostname, port: Number(targetUrl.port) },
+      { host: targetUrl.hostname, port: Number(targetUrl.port) },
+    ]);
+    expect(target.requests()).toBe(4);
+  },
+);
+
+it("authenticates a SOCKS5 proxy and keeps its URL out of authentication errors", async () => {
+  const target = await upstream();
+  const proxy = await socks5Proxy(new URL(target.url), true);
+  const transport = createUpstreamTransport();
+  cleanups.push(transport.destroy);
+  const init = { signal: AbortSignal.timeout(3_000) };
+
+  const authenticated = transport.fetchVia(`socks5://u:p@${proxy.host}`);
+  expect(await (await authenticated(target.url, init)).text()).toBe("OK");
+  const rejected = transport.fetchVia(`socks5://u:wrong@${proxy.host}`)(
+    target.url,
+    init,
+  );
+  await expect(rejected).rejects.toMatchObject({
+    message: "Account Pooler proxy connection failed.",
+    code: "unclassified transport error",
+  });
+  await expect(rejected).rejects.not.toHaveProperty("cause");
+  expect(proxy.credentials).toEqual([
+    { username: "u", password: "p" },
+    { username: "u", password: "wrong" },
+  ]);
+  expect(proxy.connections).toHaveLength(1);
+  expect(target.requests()).toBe(1);
+});
+
 it("caches separate agents per proxy and destroys all dispatchers", async () => {
   const dispatchers: Dispatcher[] = [];
   vi.stubGlobal(
@@ -129,13 +284,15 @@ it("caches separate agents per proxy and destroys all dispatchers", async () => 
   cleanups.push(transport.destroy);
   const first = "http://user:pass@proxy.invalid:3128";
   const second = "https://user:pass@other.invalid:8443";
+  const socks = "socks5://proxy.invalid:1080";
+  const socksWithRemoteDns = "socks5h://proxy.invalid:1080";
   expect(transport.fetchVia(null)).toBe(transport.fetch);
-  for (const proxy of [null, first, first, second]) {
+  for (const proxy of [null, first, first, second, socks, socksWithRemoteDns]) {
     await transport.fetchVia(proxy)(target);
   }
   expect(dispatchers[1]).toBe(dispatchers[2]);
   const unique = new Set(dispatchers);
-  expect(unique.size).toBe(3);
+  expect(unique.size).toBe(5);
   for (const dispatcher of unique)
     expect(dispatcher).toHaveProperty("destroyed", false);
   await transport.destroy();

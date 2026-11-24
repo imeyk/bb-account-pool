@@ -185,8 +185,8 @@ sets an individual priority; the same operations are available through the
 
 ## Account proxies
 
-Pipe the HTTP or HTTPS proxy URL as one line. Use **Set proxy…** in account
-settings, the `account.setProxy` RPC, or the CLI:
+Use **Set proxy…** in account settings, the `account.setProxy` RPC, or pipe
+the proxy URL as one line to the CLI:
 
 ```sh
 printf '%s\n' "$ACCOUNT_PROXY_URL" | bb pool account proxy <id> --proxy-stdin
@@ -200,6 +200,11 @@ The CLI accepts one stdin secret per command. Keep proxy URLs and their
 credentials out of command arguments and chat. In settings, either sign-in
 flow and API-key add have a **Proxy (optional)** field. Supply the proxy
 username and password together if the proxy requires credentials.
+
+Account proxy URLs support `http://`, `https://`, `socks5://`, and `socks5h://`.
+Both SOCKS5 schemes use undici's experimental `Socks5ProxyAgent` and send
+destination hostnames to the proxy for DNS resolution. Node emits an
+`ExperimentalWarning` on the first use of the agent in each process.
 
 The account proxy overrides proxy environment variables for that account's
 provider requests, token refresh, usage, profile, and sign-in requests made

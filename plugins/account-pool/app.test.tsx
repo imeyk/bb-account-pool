@@ -414,7 +414,7 @@ describe("Account Pool settings", () => {
 
   it("shows the public proxy address in account details and saves a replacement", async () => {
     const current = account({
-      proxy: { scheme: "https", host: "proxy.invalid:3128" },
+      proxy: { scheme: "socks5", host: "proxy.invalid:1080" },
     });
     const slot = render([current], { "account.setProxy": () => current });
     fireEvent.click(
@@ -422,7 +422,7 @@ describe("Account Pool settings", () => {
         name: "Open person@example.com details",
       }),
     );
-    expect(await slot.findByText("https://proxy.invalid:3128")).toBeTruthy();
+    expect(await slot.findByText("socks5://proxy.invalid:1080")).toBeTruthy();
     fireEvent.click(slot.getByRole("button", { name: "Close" }));
     fireEvent.pointerDown(
       await slot.findByRole("button", { name: "person@example.com actions" }),
@@ -430,6 +430,10 @@ describe("Account Pool settings", () => {
     fireEvent.click(await slot.findByText("Set proxy…"));
     const input = await slot.findByLabelText("Proxy address");
     expect(input).toHaveProperty("value", "");
+    expect(input).toHaveProperty(
+      "placeholder",
+      "http://, https:// or socks5://",
+    );
     const proxy = "http://user:pass@proxy.invalid:8080";
     fireEvent.change(input, { target: { value: proxy } });
     fireEvent.click(slot.getByRole("button", { name: "Save" }));

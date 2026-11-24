@@ -842,7 +842,7 @@ function ProxyInput({
       <Input
         type="password"
         autoComplete="off"
-        placeholder="https://proxy.example.com:3128"
+        placeholder="http://, https:// or socks5://"
         value={value}
         onChange={(event) => onChange(event.target.value)}
       />
@@ -1660,7 +1660,9 @@ function AccountPoolSettings() {
                       proxy.length > 0 &&
                       !proxyUrlSchema.safeParse(proxy).success
                     ) {
-                      setError("Enter a valid HTTP or HTTPS proxy URL.");
+                      setError(
+                        "Enter a valid proxy URL with http://, https:// or socks5://.",
+                      );
                       return;
                     }
                     void startLogin(dialog.provider, {
