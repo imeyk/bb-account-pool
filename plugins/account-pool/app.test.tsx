@@ -463,6 +463,32 @@ describe("Account Pool settings", () => {
     expect(group?.className).not.toMatch(/(^|\s)hidden(\s|$)/u);
   });
 
+  it("counts down each reported reset independently until the deadline", async () => {
+    const now = Date.now();
+    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
+    try {
+      vi.setSystemTime(now);
+      const slot = render([
+        account({
+          limitWindows: [
+            claudeWindow("primary", 0.2, { resetAt: now + 60_000 }),
+            claudeWindow("secondary", 0.4, { resetAt: now + 49 * 3_600_000 }),
+          ],
+        }),
+      ]);
+      expect(await slot.findByText("До сброса")).toBeTruthy();
+      expect(slot.getByText("1 мин").parentElement?.textContent).toMatch(/5H/);
+      expect(slot.getByText("2 д 1 ч").parentElement?.textContent).toMatch(
+        /7D/,
+      );
+      act(() => vi.advanceTimersByTime(60_000));
+      expect(slot.getByText("0 мин")).toBeTruthy();
+      expect(slot.getByText("2 д 0 ч")).toBeTruthy();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("dates an exhausted account by its refused window, not one past the threshold", async () => {
     const slot = render([
       account({
@@ -507,6 +533,7 @@ describe("Account Pool settings", () => {
     expect(await slot.findByText("pro@example.com")).toBeTruthy();
     expect(slot.getByText("7D")).toBeTruthy();
     expect(slot.getByText("100%")).toBeTruthy();
+    expect(slot.getByText("6 д 0 ч").parentElement?.textContent).toMatch(/7D/);
     expect(slot.queryByText("5H")).toBeNull();
     expect(slot.queryByText("FABLE")).toBeNull();
     expect(

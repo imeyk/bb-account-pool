@@ -238,6 +238,13 @@ function resetLabel(timestamp: number | null): string {
     return `resets in ${minutes >= 60 ? `${Math.floor(minutes / 60)}h ${minutes % 60}m` : `${minutes}m`}`;
   return `resets ${new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric" }).format(timestamp)}`;
 }
+function remainingQuotaTime(resetAt: number, now: number): string {
+  const minutes = Math.max(0, Math.ceil((resetAt - now) / 60_000));
+  const hours = Math.floor(minutes / 60);
+  if (hours >= 24) return `${Math.floor(hours / 24)} д ${hours % 24} ч`;
+  if (hours > 0) return `${hours} ч ${minutes % 60} мин`;
+  return `${minutes} мин`;
+}
 const STATUS_CACHE_KEY = "account-pool:status";
 
 function readCachedStatus(): PoolStatus | null {
@@ -472,6 +479,7 @@ const accountDragModifiers: Modifier[] = [restrictAccountDragToVerticalAxis];
 
 function AccountRow({
   account,
+  now,
   threshold,
   pending,
   refreshing,
@@ -480,6 +488,7 @@ function AccountRow({
   reorderDisabled,
 }: {
   account: AccountSummary;
+  now: number;
   threshold: number;
   pending: boolean;
   refreshing: boolean;
@@ -489,6 +498,9 @@ function AccountRow({
 }) {
   const status = statusPresentation(account);
   const slots = quotaSlots(account);
+  const resetWindows = account.limitWindows.filter(
+    (window) => window.windowMinutes === 300 || window.windowMinutes === 10_080,
+  );
   const email = secondaryEmail(account);
   const {
     attributes,
@@ -575,6 +587,31 @@ function AccountRow({
                 refreshing={refreshing}
               />
             ))}
+            {resetWindows.length > 0 && (
+              <div className="min-w-24 text-left tabular-nums @min-[32rem]/account-row:text-right">
+                <div className="text-2xs uppercase tracking-wide text-subtle-foreground/75">
+                  До сброса
+                </div>
+                {resetWindows.map((window) => (
+                  <div
+                    key={window.slot}
+                    className="whitespace-nowrap text-xs text-muted-foreground"
+                  >
+                    {windowShortLabel(window)} ·{" "}
+                    {window.resetAt === null ? (
+                      "нет данных"
+                    ) : (
+                      <time
+                        dateTime={new Date(window.resetAt).toISOString()}
+                        title={new Date(window.resetAt).toLocaleString()}
+                      >
+                        {remainingQuotaTime(window.resetAt, now)}
+                      </time>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         </button>
         <DropdownMenu>
@@ -1186,6 +1223,11 @@ function AccountPoolSettings() {
   const rpc = useRpc<typeof accountPoolRpcContract>();
   const navigate = useBbNavigate();
   const [status, setStatus] = useState<PoolStatus | null>(readCachedStatus);
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
   const [statusIsCached, setStatusIsCached] = useState(status !== null);
   const [config, setConfig] = useState<AccountPoolConfig | null>(null);
   const [drafts, setDrafts] = useState<Record<ConfigField, string>>({
@@ -1689,6 +1731,7 @@ function AccountPoolSettings() {
                         <AccountRow
                           key={account.id}
                           account={account}
+                          now={now}
                           threshold={threshold}
                           pending={accountPending(account.id)}
                           refreshing={
