@@ -118,6 +118,7 @@ async function createPool(provider: PoolProvider, refreshFailureStatus = 400) {
       ...current,
       now,
       fetch: transport,
+      rotationMode: async () => "weekly",
       getSettings: () =>
         accountPoolConfigSchema.parse({
           anthropicUpstreamBaseUrl: UPSTREAM_URL,

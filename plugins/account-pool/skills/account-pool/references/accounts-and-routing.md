@@ -17,6 +17,9 @@ bb pool account disable <id>
 bb pool account priority <id> <n>
 bb pool account reorder <claude|codex> <id>...
 bb pool account refresh <id>
+bb pool account proxy-check <id> [--proxy-stdin]
+bb pool account proxy-exit <id>
+bb pool rotation [weekly|sequential]
 bb pool status [--json]
 bb pool routing <claude|codex> [--off]
 bb pool config
@@ -25,6 +28,10 @@ bb pool parent [proxy|isolate]
 bb pool token rotate --machine <id-or-name>
 bb pool bypass <thread-id> [--off]
 ```
+
+Account rows show the public egress IP and country from Cloudflare via the saved proxy (`bb pool account proxy-exit <id>`). If lookup fails, the row shows the configured endpoint and reports the exit IP as unknown. When a request selects a proxied account, its retries stay on that account. A failed proxy or unreadable proxy file prevents delivery through another account for that request.
+
+In the account actions menu, open **Set proxy…** and select **Проверить соединение**. A blank field checks the saved address. Enter a replacement to check it before saving. `bb pool account proxy-check <id>` and its `--proxy-stdin` option perform the same check. HTTP status and elapsed time describe an unauthenticated HTTPS connection to the provider. A failed check exits with code 1.
 
 Every command accepts `--json` and `--help`. `bb pool --help` lists the
 commands; `bb pool <command> --help` prints that command's arguments, options,
@@ -114,7 +121,9 @@ inspect the full routing configuration and
 `bb pool config set <key> <value>` to update one value. The upstream URL keys
 are QA-only overrides; `switchThreshold` must be greater than 0 and at most 1.
 
-Accounts run sequentially per provider: lower priority numbers first, with ties
+Use `bb pool rotation weekly` (default) to prefer the lowest observed weekly usage within the eligible accounts of the requested provider. Known current weekly windows come first. Ties or missing data use the sequential order. Manual choices and conversation pins take precedence. Open **Advanced** → **Режим ротации** in Account Pooler settings or run `bb pool rotation` to inspect the mode.
+
+With `bb pool rotation sequential`, lower priority numbers come first, with ties
 following the order accounts were added. New conversations use the current
 account until it reaches the switch threshold or fails; the pool then advances
 to the next eligible account and wraps at the end. It keeps using that fallback
@@ -126,13 +135,13 @@ conversations can advance. A model-family limit detours only requests for that
 family without moving the session's main pin or the provider cursor.
 
 An HTTP 408, 500, 502, 503, 504 or 529 response, or a connection failure,
-before the response starts, retries a pinned conversation on its own account
+before a successful response starts, retries a pinned conversation or a request using an account proxy on its own account
 first: up to twice, after 1 and then 2 seconds, or after the response's
 `Retry-After` when that is at most 20 seconds. Prompt caches stay with the
 account, so a move would rewrite the whole cached context. When the retries
-fail, or the wait is longer, the request fails over to the next account, and
+fail, or the wait is longer, a proxied request returns an error. Requests without an account proxy can fail over to the next account, and
 the session's pin moves to the account that served it, where its context is now
-cached. Conversations without a pin fail over at once. The cursor
+cached. Conversations without a pin or an account proxy fail over at once. Once a response is streaming to the client, the pool reports an interruption without replaying the request. The cursor
 and session pins survive hub restarts. Session pins expire after 30 idle minutes,
 and the pool retains the 4,096 most recently used pins.
 

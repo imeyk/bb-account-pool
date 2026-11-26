@@ -10,10 +10,14 @@ import {
 } from "./usage-contract.js";
 import fs from "node:fs/promises";
 import http, { type IncomingMessage, type ServerResponse } from "node:http";
+import net from "node:net";
 import path from "node:path";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { createFakePluginHost } from "@get-bb/plugin-sdk/testing";
+import {
+  createFakePluginHost,
+  makeMessageDispatchHookContext,
+} from "@get-bb/plugin-sdk/testing";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   accountSchema,
@@ -118,9 +122,10 @@ async function resolveToken(
 async function resolveCodexToken(
   host: ReturnType<typeof createFakePluginHost>,
   hostId = "host-one",
+  threadId = "thread-codex",
 ): Promise<{ token: string; baseUrl: string }> {
   const entries = await host.harness.behavior.resolveProviderEnv("codex", {
-    threadId: "thread-codex",
+    threadId,
     projectId: "project-one",
     hostId,
   });
@@ -496,6 +501,93 @@ describe("Account Pool config schema", () => {
 });
 
 describe("Account Pool plugin", () => {
+  it("keeps masked credentials server-side and binds their reuse to the original proxy", async () => {
+    const calls: Array<string | null> = [];
+    const fixture = await createFixture({
+      upstreamUrl: "https://upstream.invalid",
+      options: {
+        fetchVia: (proxy) => async (url, init) => {
+          if (String(url).includes("/cdn-cgi/trace")) {
+            calls.push(proxy);
+            expect(init?.headers).toBeUndefined();
+            return new Response("ip=203.0.113.1\nloc=NL\n");
+          }
+          return Response.json({});
+        },
+      },
+    });
+    const rpc = fixture.host.harness.behavior;
+    const id = fixture.account.id;
+    await rpc.callRpc("account.setProxy", {
+      id,
+      proxy: "socks5://user:p%40ss@proxy.invalid",
+    });
+    const fields = {
+      scheme: "socks5",
+      host: "proxy.invalid",
+      port: "1080",
+      user: null,
+      password: null,
+    };
+    await expect(
+      rpc.callRpc("account.saveProxyFields", {
+        id,
+        fields: { ...fields, host: "other.invalid" },
+      }),
+    ).rejects.toThrow();
+    await rpc.callRpc("account.saveProxyFields", { id, fields });
+    expect(await rpc.callRpc("account.proxyExit", { id })).toEqual({
+      ip: "203.0.113.1",
+      country: "NL",
+    });
+    expect(calls).toEqual(["socks5://user:p%40ss@proxy.invalid:1080"]);
+  });
+
+  it("checks a draft or saved proxy against the provider without account credentials or a direct fallback", async () => {
+    const saved = "http://proxy.invalid:3128";
+    const draft = "socks5://user:secret@proxy.invalid:1080";
+    const requests: string[] = [];
+    const { host, account } = await createFixture({
+      upstreamUrl: "https://upstream.invalid",
+      options: {
+        fetchVia: (proxy) => async (input, init) => {
+          if (init?.method !== "HEAD") return Response.json({});
+          requests.push(String(proxy));
+          expect(String(input)).toBe("https://api.anthropic.com/v1/models");
+          expect(init.headers).toBeUndefined();
+          expect(init.redirect).toBe("manual");
+          expect(init.signal).toBeTruthy();
+          if (proxy === draft) throw new Error(draft);
+          return new Response(null, { status: 401 });
+        },
+      },
+    });
+    const harness = host.harness.behavior;
+    const check = () =>
+      harness.callRpc("account.checkProxy", { id: account.id });
+    expect(await check()).toMatchObject({ connected: false, status: null });
+    expect(requests).toEqual([]);
+    await harness.callRpc("account.setProxy", { id: account.id, proxy: saved });
+    const failed = await harness.callRpc("account.checkProxy", {
+      id: account.id,
+      proxy: draft,
+    });
+    expect(failed).toMatchObject({ connected: false, status: null });
+    expect(JSON.stringify(failed)).not.toContain("secret");
+    const result = await harness.runCli([
+      "account",
+      "proxy-check",
+      account.id,
+      "--json",
+    ]);
+    expect(result.exitCode).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({
+      connected: true,
+      status: 401,
+    });
+    expect(requests).toEqual([draft, saved]);
+  });
+
   it("sets an account proxy through RPC and the materialized CLI stdin option, then removes it with --off", async () => {
     const proxy = "https://user:pass@proxy.invalid:3128";
     const { host, account } = await createFixture({
@@ -587,7 +679,13 @@ describe("Account Pool plugin", () => {
     const addedAccount = accountSchema.parse(added);
     const store = new AccountStore(
       host.bb.storage.kv,
-      path.join(host.bb.storage.experimental_directory(), "accounts"),
+      path.join(
+        host.bb.server.experimental_dataDir,
+        "plugins",
+        "account-pool",
+        "secrets",
+        "accounts",
+      ),
     );
     expect(await store.readProxy(addedAccount.id)).toBe(proxy);
 
@@ -614,6 +712,105 @@ describe("Account Pool plugin", () => {
     expect(serialized).not.toContain(proxy);
     expect(serialized).not.toContain(socksProxy.slice(0, -1));
   });
+
+  it("never delivers a protected request to a reachable direct upstream when the proxy is down", async () => {
+    let received = 0;
+    const target = await startUpstream((_req, res) => {
+      received++;
+      res.end("ok");
+    });
+    cleanups.push(() => target.close());
+    const unavailable = await startUpstream((_req, res) => {
+      res.end();
+    });
+    await unavailable.close();
+    const fixture = await createFixture({
+      upstreamUrl: target.url,
+      priority: 1,
+    });
+    const rpc = fixture.host.harness.behavior;
+    const send = async () => {
+      const response = await rpc.fetchHttp("POST", "/v1/messages", {
+        headers: authHeaders(fixture.key),
+        body: JSON.stringify({ model: "claude", messages: [] }),
+      });
+      await response.text();
+      return response.status;
+    };
+    expect(await send()).toBe(200);
+    await addApiAccount(fixture, "sk-fallback", 2);
+    await rpc.callRpc("account.setProxy", {
+      id: fixture.account.id,
+      proxy: unavailable.url,
+    });
+    expect(await send()).toBeGreaterThanOrEqual(400);
+    expect(received).toBe(1);
+  });
+
+  it.each([
+    { scheme: "http", recovers: true },
+    { scheme: "http", recovers: false },
+    { scheme: "socks5", recovers: true },
+  ])(
+    "retries an unpinned request through the same $scheme proxy after a disconnect (recovers: $recovers)",
+    async ({ scheme, recovers }) => {
+      const attempts: number[] = [];
+      const reply =
+        "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+      const proxy = net.createServer((socket) => {
+        attempts.push(performance.now());
+        const recoverNow = recovers && attempts.length === 3;
+        socket.once("data", () => {
+          if (scheme === "socks5") {
+            socket.write(Buffer.from([5, 0]));
+            socket.once("data", () => {
+              socket.write(Buffer.from([5, 0, 0, 1, 127, 0, 0, 1, 0, 0]));
+              socket.once("data", () =>
+                recoverNow ? socket.end(reply) : socket.destroy(),
+              );
+            });
+          } else if (recoverNow) {
+            socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+            socket.once("data", () => socket.end(reply));
+          } else socket.destroy();
+        });
+      });
+      await new Promise<void>((resolve) =>
+        proxy.listen(0, "127.0.0.1", resolve),
+      );
+      cleanups.push(
+        () => new Promise<void>((resolve) => proxy.close(() => resolve())),
+      );
+      const address = proxy.address();
+      if (!address || typeof address === "string")
+        throw new Error("Missing proxy port");
+      const direct = vi.fn(async () => new Response("direct"));
+      const fixture = await createFixture({
+        upstreamUrl: "http://provider.invalid",
+        priority: 1,
+        options: { fetch: direct },
+      });
+      const rpc = fixture.host.harness.behavior;
+      await addApiAccount(fixture, "sk-fallback", 2);
+      await rpc.callRpc("account.setProxy", {
+        id: fixture.account.id,
+        proxy: `${scheme}://127.0.0.1:${address.port}`,
+      });
+      direct.mockClear();
+      const response = await rpc.fetchHttp("POST", "/v1/messages", {
+        headers: authHeaders(fixture.key),
+        body: JSON.stringify({ model: "claude", messages: [] }),
+      });
+      const body = await response.text();
+      expect(attempts).toHaveLength(3);
+      expect(attempts[1]! - attempts[0]!).toBeGreaterThanOrEqual(990);
+      expect(attempts[2]! - attempts[1]!).toBeGreaterThanOrEqual(1990);
+      expect(response.status).toBe(recovers ? 200 : 502);
+      if (recovers) expect(body).toBe("ok");
+      expect(direct).not.toHaveBeenCalled();
+    },
+    10000,
+  );
 
   it.each([true, false])(
     "fails closed on a missing proxy file with another account enabled = %s",
@@ -649,7 +846,10 @@ describe("Account Pool plugin", () => {
       expect(calls.splice(0)).toEqual([{ proxy, apiKey: "sk-account" }]);
       if (fallback) await addApiAccount(fixture, "sk-fallback", 2);
       const dir = path.join(
-        host.bb.storage.experimental_directory(),
+        host.bb.server.experimental_dataDir,
+        "plugins",
+        "account-pool",
+        "secrets",
         "accounts",
       );
       const file = path.join(dir, `account-${account.id}.proxy.json`);
@@ -669,15 +869,11 @@ describe("Account Pool plugin", () => {
 
       expect(await resolveToken(host)).toBe(key);
       const after = await send();
-      expect(after.status).toBe(fallback ? 200 : 429);
+      expect(after.status).toBe(429);
       expect(await after.text()).toContain(
-        fallback
-          ? "response"
-          : "No Account Pooler account is currently eligible.",
+        "No Account Pooler account is currently eligible.",
       );
-      expect(calls.splice(0)).toEqual(
-        fallback ? [{ proxy: null, apiKey: "sk-fallback" }] : [],
-      );
+      expect(calls.splice(0)).toEqual([]);
     },
   );
 
@@ -702,7 +898,10 @@ describe("Account Pool plugin", () => {
       });
     await rpc.callRpc("account.setProxy", { id: account.id, proxy });
     const file = path.join(
-      host.bb.storage.experimental_directory(),
+      host.bb.server.experimental_dataDir,
+      "plugins",
+      "account-pool",
+      "secrets",
       "accounts",
       `account-${account.id}.proxy.json`,
     );
@@ -971,6 +1170,145 @@ describe("Account Pool plugin", () => {
       expect(await requests[0]?.text()).toBe(body);
     },
   );
+
+  it("routes the first Claude handoff message to the chosen account and rejects mismatched providers", async () => {
+    const seen: string[] = [];
+    const fixture = await createFixture({
+      upstreamUrl: "https://upstream.example",
+      options: {
+        fetch: async (_url, init) => {
+          seen.push(new Headers(init?.headers).get("x-api-key") ?? "");
+          return Response.json({});
+        },
+      },
+    });
+    const second = await addApiAccount(fixture, "sk-second");
+    const hook = fixture.host.harness.registrations.hooks["message.dispatch"]!;
+    const dispatch = (providerId: string) =>
+      hook(
+        makeMessageDispatchHookContext({
+          thread: { id: "claude-destination", providerId },
+          experimental_submission: {
+            pluginId: "account-pool",
+            data: { accountId: second.id },
+          },
+        }),
+      );
+    const beforeChoice = await resolveToken(
+      fixture.host,
+      "host-one",
+      "claude-destination",
+    );
+    expect(await dispatch("codex")).toMatchObject({ action: "reject" });
+    expect(await dispatch("claude-code")).toMatchObject({ action: "proceed" });
+    const response = await fixture.host.harness.behavior.fetchHttp(
+      "POST",
+      "/v1/messages",
+      { headers: authHeaders(beforeChoice), body: "{}" },
+    );
+    await response.text();
+    expect(response.status).toBe(200);
+    expect(seen.at(-1)).toBe("sk-second");
+  });
+
+  it("keeps manual Codex choices local and ranks auto threads by weekly usage", async () => {
+    const accountsSeen: string[] = [];
+    const fixture = await createOAuthRequestFixture(
+      "codex",
+      async (_input, init) => {
+        const id = new Headers(init?.headers).get("chatgpt-account-id")!;
+        accountsSeen.push(id);
+        return Response.json(
+          {},
+          {
+            headers: {
+              "x-codex-secondary-used-percent": id === "second" ? "20" : "70",
+              "x-codex-secondary-window-minutes": "10080",
+              "x-codex-secondary-reset-after-seconds": "3600",
+            },
+          },
+        );
+      },
+      Date.now,
+    );
+    const second = await addExistingAccount(
+      {
+        host: fixture.host,
+        logins: {
+          codexLogin: async () => ({
+            accessToken: "second-token",
+            refreshToken: "refresh-2",
+            idToken: null,
+            accountId: "second",
+            email: "second@example.com",
+            expiresAt: Date.now() + 3600000,
+          }),
+        },
+      },
+      "codex",
+    );
+    const rpc = fixture.host.harness.behavior;
+    const choose = (threadId: string, accountId: string | null) =>
+      rpc.callRpc("thread.choose", { threadId, accountId });
+    const call = async (threadId: string) => {
+      const { token } = await resolveCodexToken(
+        fixture.host,
+        "host-one",
+        threadId,
+      );
+      const response = await rpc.fetchHttp("POST", "/v1/responses", {
+        headers: { "x-bb-account-pool-token": token, "thread-id": threadId },
+        body: JSON.stringify({ model: "codex", input: "hello" }),
+      });
+      await response.text();
+      return response.status;
+    };
+    await choose("one", fixture.account.id);
+    const dispatch =
+      fixture.host.harness.registrations.hooks["message.dispatch"]!;
+    const firstMessage = (accountId: string) =>
+      makeMessageDispatchHookContext({
+        thread: { id: "two", providerId: "codex" },
+        experimental_submission: {
+          pluginId: "account-pool",
+          data: { accountId },
+        },
+      });
+    expect(await dispatch(firstMessage(second.id))).toEqual({
+      action: "proceed",
+    });
+    expect(await call("one")).toBe(200);
+    expect(await call("two")).toBe(200);
+    expect(await call("three")).toBe(200);
+    await choose("two", fixture.account.id);
+    expect(await call("two")).toBe(200);
+    await choose("two", null);
+    expect(await call("two")).toBe(200);
+    expect(accountsSeen).toEqual([
+      "chatgpt-account",
+      "second",
+      "second",
+      "chatgpt-account",
+      "second",
+    ]);
+    const sequential = await rpc.runCli(["rotation", "sequential"]);
+    expect(sequential.exitCode).toBe(0);
+    expect(await call("four")).toBe(200);
+    expect(accountsSeen.at(-1)).toBe("chatgpt-account");
+    await rpc.callRpc("routing.setRotationMode", "weekly");
+    expect((await rpc.runCli(["rotation"])).stdout.trim()).toBe("weekly");
+    expect(await call("five")).toBe(200);
+    expect(accountsSeen.at(-1)).toBe("second");
+    await choose("one", second.id);
+    await rpc.callRpc("account.disable", { id: second.id });
+    expect(await dispatch(firstMessage(second.id))).toMatchObject({
+      action: "reject",
+    });
+    expect(await call("one")).toBe(503);
+    await rpc.callRpc("account.disable", { id: fixture.account.id });
+    expect(await call("one")).toBe(503);
+    expect(accountsSeen).toHaveLength(7);
+  });
 
   it("refreshes and routes Codex HTTP sessions by provider", async () => {
     const seen: Array<{
@@ -2192,7 +2530,7 @@ describe("Account Pool plugin", () => {
       },
       {
         name: "BB_ACCOUNT_POOL_PARENT_TOKEN",
-        value: fixture.key,
+        value: fixture.key.split(".")[0],
         reason: "Account Pooler hub token for this machine",
       },
     ]);
@@ -2233,7 +2571,10 @@ describe("Account Pool plugin", () => {
   });
 
   it("lists Claude models through the hub with a pooled account's credentials", async () => {
-    const seen: Array<{ url: string | undefined; authorization: string | undefined }> = [];
+    const seen: Array<{
+      url: string | undefined;
+      authorization: string | undefined;
+    }> = [];
     const upstream = await startUpstream(async (request, response) => {
       await readRequestBody(request);
       seen.push({
@@ -2315,7 +2656,7 @@ describe("Account Pool plugin", () => {
       },
       {
         name: "CODEX_POOL_AUTH_TOKEN",
-        value: fixture.key,
+        value: fixture.key.split(".")[0],
         reason: "Account Pooler hub token for this machine",
       },
     ]);
@@ -4304,9 +4645,7 @@ describe("Account Pool plugin", () => {
     const upstreamKey = (init: RequestInit | undefined) => {
       const headers = new Headers(init?.headers);
       return (
-        headers.get("x-api-key") ??
-        headers.get("authorization")?.slice(7) ??
-        ""
+        headers.get("x-api-key") ?? headers.get("authorization")?.slice(7) ?? ""
       );
     };
 
@@ -5656,10 +5995,10 @@ describe("Account Pool plugin", () => {
               : reason === "network error"
                 ? ["sk-first", "sk-first", "sk-first", "sk-first"]
                 : [
-                  "sk-first",
-                  "sk-second",
-                  reason === "family quota" ? "sk-first" : "sk-second",
-                ],
+                    "sk-first",
+                    "sk-second",
+                    reason === "family quota" ? "sk-first" : "sk-second",
+                  ],
           );
         } finally {
           finishOld();
@@ -6775,7 +7114,10 @@ describe("sequential pool recovery", () => {
         fetch: async (_input, init) => {
           attempts.push(new Headers(init?.headers).get("x-api-key"));
           return outage
-            ? Response.json({}, { status: 503, headers: { "retry-after": "0" } })
+            ? Response.json(
+                {},
+                { status: 503, headers: { "retry-after": "0" } },
+              )
             : Response.json({});
         },
       },

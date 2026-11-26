@@ -13,6 +13,7 @@ import {
   type ModelFamily,
   type PoolProvider,
   type PoolStatus,
+  type RotationMode,
 } from "./contracts.js";
 import { createClaudeAdapter } from "./claude-adapter.js";
 import {
@@ -82,9 +83,11 @@ interface HubOptions {
   getSettings: () => AccountPoolConfig;
   adapters: ReadonlyMap<PoolProvider, ProviderAdapter>;
   fetch: typeof fetch;
-  fetchFor: (account: Account) => Promise<typeof fetch>;
+  fetchFor: (account: Account, requireProxy?: boolean) => Promise<typeof fetch>;
   now: () => number;
   drainTimeoutMs: number;
+  threadChoice?: (threadId: string) => Promise<string | null>;
+  rotationMode: () => Promise<RotationMode>;
   getParentRoute: () => ParentPool | null;
   onAccountsChanged: () => void;
   onUpstreamError: (provider: PoolProvider, error: unknown) => void;
@@ -177,11 +180,18 @@ export class AccountPoolHub {
     await this.stop();
   }
 
-  async authenticate(request: Request): Promise<string | null> {
-    const token =
+  private credentials(request: Request) {
+    const presented =
       request.headers.get("x-bb-account-pool-token") ??
       readBearer(request.headers.get("authorization"));
-    return this.options.hubTokens.authenticate(token);
+    const scoped = presented?.match(
+      /^([A-Za-z0-9_-]+)\.([A-Za-z0-9_-]{1,200})$/,
+    );
+    return { token: scoped?.[1] ?? presented, threadId: scoped?.[2] ?? null };
+  }
+
+  async authenticate(request: Request): Promise<string | null> {
+    return this.options.hubTokens.authenticate(this.credentials(request).token);
   }
 
   async replaceSecret(accountId: string, secret: AccountSecret): Promise<void> {
@@ -220,7 +230,8 @@ export class AccountPoolHub {
     routePath: string,
   ): Promise<Response> {
     const adapter = this.adapter(provider);
-    const hostId = await this.authenticate(request);
+    const { token, threadId } = this.credentials(request);
+    const hostId = await this.options.hubTokens.authenticate(token);
     if (hostId === null) {
       return adapter.errorResponse(401, "Invalid Account Pooler bearer token.");
     }
@@ -238,6 +249,7 @@ export class AccountPoolHub {
       new Uint8Array(await request.arrayBuffer()),
       adapter,
       hostId,
+      threadId,
     );
   }
 
@@ -420,7 +432,9 @@ export class AccountPoolHub {
     }
   }
 
-  async status(): Promise<Omit<PoolStatus, "routing" | "parent">> {
+  async status(): Promise<
+    Omit<PoolStatus, "rotationMode" | "routing" | "parent">
+  > {
     const now = this.options.now();
     const accounts = (await this.options.accounts.list()).sort(
       (left, right) => left.priority - right.priority,
@@ -468,6 +482,7 @@ export class AccountPoolHub {
             : {
                 scheme: proxySchemeSchema.parse(url.protocol.slice(0, -1)),
                 host: url.host,
+                ...(url.username ? { authenticated: true } : {}),
               },
         proxyUnreadable: false,
       };
@@ -482,6 +497,7 @@ export class AccountPoolHub {
     body: Uint8Array,
     adapter: ProviderAdapter,
     hostId: string,
+    threadId: string | null,
   ): Promise<Response> {
     const signal = AbortSignal.any([request.signal, this.stopped.signal]);
     const attempted = new Set<string>();
@@ -494,10 +510,20 @@ export class AccountPoolHub {
     let previousAccountId: string | null = null;
     let failure: FailureSummary | null = null;
     let usageRefreshed = false;
+    let requireProxy = false;
     const accounts = (await this.options.accounts.list()).filter(
       (account) => account.provider === adapter.provider,
     );
-    const candidateIds = new Set(accounts.map((account) => account.id));
+    const choice = threadId
+      ? await this.options.threadChoice?.(threadId)
+      : null;
+    const candidateIds = new Set(
+      accounts
+        .filter((account) => !choice || account.id === choice)
+        .map((account) => account.id),
+    );
+    const preferWeekly =
+      !choice && (await this.options.rotationMode()) === "weekly";
     const parsed = adapter.parseRequest(body, request.headers);
     const family = parsed.family;
     const affinityKey =
@@ -521,7 +547,19 @@ export class AccountPoolHub {
           previousAccountId,
           routing,
           signal,
+          preferWeekly,
+          Boolean(choice),
         );
+        if (selected && !requireProxy) {
+          const policy = await this.proxyStatus(selected.account.id);
+          if (policy.proxy || policy.proxyUnreadable) {
+            requireProxy = true;
+            for (const id of candidateIds) {
+              if (id !== selected.account.id && !attempted.has(id))
+                candidateIds.delete(id);
+            }
+          }
+        }
         if (
           !usageRefreshed &&
           (selected === null ||
@@ -597,7 +635,13 @@ export class AccountPoolHub {
         try {
           signal.throwIfAborted();
           secret = await abortable(
-            this.freshSecret(selected.account, adapter, { kind: "normal" }),
+            this.freshSecret(
+              selected.account,
+              adapter,
+              { kind: "normal" },
+              false,
+              requireProxy,
+            ),
             signal,
           );
         } catch (error) {
@@ -622,7 +666,7 @@ export class AccountPoolHub {
         const retryTransient = async (
           retryAfter: string | null,
         ): Promise<boolean> => {
-          if (!selected.keepAffinity) return false;
+          if (!selected.keepAffinity && !requireProxy) return false;
           const delayMs = transientRetryDelay(
             transientRetries,
             retryAfter,
@@ -644,6 +688,7 @@ export class AccountPoolHub {
               selected.account,
               secret,
               adapter,
+              requireProxy,
             );
           } catch (error) {
             if (pacing !== null) {
@@ -749,10 +794,16 @@ export class AccountPoolHub {
               authRetried = true;
               try {
                 secret = await abortable(
-                  this.freshSecret(selected.account, adapter, {
-                    kind: "rejected",
-                    accessToken: secret.accessToken,
-                  }),
+                  this.freshSecret(
+                    selected.account,
+                    adapter,
+                    {
+                      kind: "rejected",
+                      accessToken: secret.accessToken,
+                    },
+                    false,
+                    requireProxy,
+                  ),
                   signal,
                 );
               } catch (error) {
@@ -817,6 +868,11 @@ export class AccountPoolHub {
         }
       }
       signal.throwIfAborted();
+      if (choice && !failure)
+        return adapter.errorResponse(
+          503,
+          "The selected account is unavailable.",
+        );
       return failure === null
         ? this.noEligibleResponse(accounts, family, adapter)
         : adapter.errorResponse(
@@ -941,6 +997,8 @@ export class AccountPoolHub {
     previousAccountId: string | null,
     routing: RoutingAttempt,
     signal: AbortSignal,
+    preferWeekly: boolean,
+    manual: boolean,
   ): Promise<SelectedAccount | null> {
     const accounts = (await this.options.accounts.list()).sort(
       (left, right) => left.priority - right.priority,
@@ -1028,21 +1086,35 @@ export class AccountPoolHub {
         candidates.find((candidate) => candidate.account.id === account.id),
       )
       .find((candidate) => candidate !== undefined);
+    const weekly = (candidate: (typeof candidates)[number]) =>
+      candidate.quota.limitWindows.find(
+        (window) =>
+          window.windowMinutes === 10080 &&
+          (window.resetAt === null || window.resetAt > now),
+      )?.utilization ?? Infinity;
+    const preferred =
+      boundAccountId === null &&
+      previousAccountId === null &&
+      activeAccount !== undefined &&
+      unattempted.includes(activeAccount)
+        ? activeAccount
+        : next;
+    const leastUsed =
+      preferWeekly && (!preferred || candidates.includes(preferred))
+        ? candidates.reduce<typeof preferred>(
+            (best, item) =>
+              !best || weekly(item) < weekly(best) ? item : best,
+            preferred,
+          )
+        : preferred;
     const selected =
       bound !== undefined && isUnattempted(bound)
         ? bound
-        : (inherited ??
-          (boundAccountId === null &&
-          previousAccountId === null &&
-          activeAccount !== undefined &&
-          unattempted.includes(activeAccount)
-            ? activeAccount
-            : next) ??
-          null);
+        : (inherited ?? leastUsed ?? null);
     if (selected === null) return null;
     if (routing.active === null)
       routing.pinnedAccountId = boundAccountId ?? inherited?.account.id ?? null;
-    if (affinityKey !== null && binding === undefined) {
+    if (!manual && affinityKey !== null && binding === undefined) {
       binding = { accountId: selected.account.id, lastUsedAt: now };
       this.affinityBindings.set(affinityKey, binding);
     }
@@ -1088,6 +1160,7 @@ export class AccountPoolHub {
       ...selected,
       keepAffinity: selected.account.id === routing.pinnedAccountId,
       accept: () => {
+        if (manual) return;
         if (rebind && this.affinityBindings.get(affinityKey) === binding) {
           const accepted = {
             accountId: selected.account.id,
@@ -1110,6 +1183,7 @@ export class AccountPoolHub {
     adapter: ProviderAdapter,
     use: SecretUse,
     recover = false,
+    requireProxy = false,
   ): Promise<AccountSecret> {
     while (true) {
       const existing = this.refreshes.get(account.id);
@@ -1206,7 +1280,10 @@ export class AccountPoolHub {
               }
               throw backoff.error;
             }
-            const accountFetch = await this.options.fetchFor(account);
+            const accountFetch = await this.options.fetchFor(
+              account,
+              requireProxy,
+            );
             try {
               const result = await adapter.refreshSecret({
                 account,
@@ -1304,6 +1381,7 @@ export class AccountPoolHub {
     account: Account,
     secret: AccountSecret,
     adapter: ProviderAdapter,
+    requireProxy: boolean,
   ): Promise<UpstreamResult> {
     this.increment(account.id);
     const { controller, release } = this.trackRequest(request, () =>
@@ -1314,7 +1392,7 @@ export class AccountPoolHub {
       new Uint8Array(upstreamBody).set(body);
       const url = adapter.upstreamUrl(request, this.options.getSettings());
       const headers = adapter.requestHeaders(request.headers, account, secret);
-      const accountFetch = await this.options.fetchFor(account);
+      const accountFetch = await this.options.fetchFor(account, requireProxy);
       const response = await accountFetch(url, {
         method: request.method,
         headers,
@@ -1568,6 +1646,8 @@ export function createHub(options: {
   profileUrl?: string;
   drainTimeoutMs?: number;
   maxAffinityBindings?: number;
+  threadChoice?: (threadId: string) => Promise<string | null>;
+  rotationMode: () => Promise<RotationMode>;
   getParentRoute?: () => ParentPool | null;
   onAccountsChanged?: () => void;
   onUpstreamError?: (provider: PoolProvider, error: unknown) => void;
@@ -1602,6 +1682,8 @@ export function createHub(options: {
     fetchFor: options.fetchFor ?? (async () => options.fetch ?? fetch),
     now: options.now ?? Date.now,
     drainTimeoutMs: options.drainTimeoutMs ?? 60_000,
+    rotationMode: options.rotationMode,
+    threadChoice: options.threadChoice,
     getParentRoute: options.getParentRoute ?? (() => null),
     onAccountsChanged: options.onAccountsChanged ?? (() => {}),
     onUpstreamError: options.onUpstreamError ?? (() => {}),

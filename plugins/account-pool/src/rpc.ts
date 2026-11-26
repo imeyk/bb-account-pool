@@ -9,6 +9,11 @@ import {
   accountReorderInputSchema,
   accountSchema,
   accountSetProxyInputSchema,
+  proxyCheckInputSchema,
+  proxyEditorInput,
+  proxyExitSchema,
+  proxyCheckResultSchema,
+  rotationModeSchema,
   accountSummarySchema,
   bypassInputSchema,
   codexLoginCancelSchema,
@@ -30,6 +35,19 @@ import type { ClaudeOAuthLogin } from "./oauth-login.js";
 import type { CodexDeviceLogin } from "./codex-device-login.js";
 
 export const accountPoolRpcContract = defineRpcContract({
+  "thread.choice": {
+    input: z.object({ threadId: z.string().min(1) }).strict(),
+    output: z.string().uuid().nullable(),
+  },
+  "thread.choose": {
+    input: z
+      .object({
+        threadId: z.string().min(1),
+        accountId: z.string().uuid().nullable(),
+      })
+      .strict(),
+    output: z.string().uuid().nullable(),
+  },
   "account.add": {
     input: accountAddInputSchema,
     output: accountSchema,
@@ -49,6 +67,23 @@ export const accountPoolRpcContract = defineRpcContract({
   "account.disable": {
     input: accountIdInputSchema,
     output: z.object({ account: accountSchema.nullable() }).strict(),
+  },
+  "routing.setRotationMode": {
+    input: rotationModeSchema,
+    output: z.null(),
+  },
+  "account.proxyExit": { input: accountIdInputSchema, output: proxyExitSchema },
+  "account.saveProxyFields": {
+    input: proxyEditorInput,
+    output: accountSummarySchema.nullable(),
+  },
+  "account.checkProxyFields": {
+    input: proxyEditorInput,
+    output: proxyCheckResultSchema,
+  },
+  "account.checkProxy": {
+    input: proxyCheckInputSchema,
+    output: proxyCheckResultSchema,
   },
   "account.setProxy": {
     input: accountSetProxyInputSchema,
@@ -125,6 +160,9 @@ export function createRpcHandlers(
   config: AccountPoolConfigController,
 ): PluginRpcHandlers<typeof accountPoolRpcContract> {
   return {
+    "thread.choice": ({ threadId }) => operations.threadChoice(threadId),
+    "thread.choose": ({ threadId, accountId }) =>
+      operations.setThreadChoice(threadId, accountId),
     "account.add": (input) => operations.add(input),
     "account.list": () => operations.list(),
     "account.remove": async ({ id }) => ({
@@ -136,6 +174,16 @@ export function createRpcHandlers(
     "account.disable": async ({ id }) => ({
       account: await operations.disable(id),
     }),
+    "routing.setRotationMode": async (mode) => {
+      await operations.setRotationMode(mode);
+      return null;
+    },
+    "account.proxyExit": ({ id }) => operations.proxyExit(id),
+    "account.saveProxyFields": async ({ id, fields }) =>
+      operations.setProxy(id, await operations.editorAddress(id, fields)),
+    "account.checkProxyFields": async ({ id, fields }) =>
+      operations.checkProxy(id, await operations.editorAddress(id, fields)),
+    "account.checkProxy": ({ id, proxy }) => operations.checkProxy(id, proxy),
     "account.setProxy": ({ id, proxy }) => operations.setProxy(id, proxy),
     "account.setPriority": async ({ accountId, priority }) => ({
       account: await operations.setPriority(accountId, priority),

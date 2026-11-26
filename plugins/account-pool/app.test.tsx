@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { act, cleanup, fireEvent, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { makeThreadResponse } from "@get-bb/plugin-sdk/testing";
 import { loadPluginApp, renderSlot } from "@get-bb/plugin-sdk/testing/app";
 import type {
   AccountPoolConfig,
@@ -114,6 +115,7 @@ function status(accounts: AccountSummary[] = [account()]): PoolStatus {
       { hostId: "host-one", hostName: "bee", mintedAt: 1, lastUsedAt: 2 },
     ],
     accounts,
+    rotationMode: "weekly",
     routing: { claude: true, codex: true },
     parent: null,
   };
@@ -148,6 +150,139 @@ function render(
     },
   );
 }
+
+it("shows the weekly usage in the composer and saves the chosen Codex account", async () => {
+  const codex = account({
+    provider: "codex",
+    limitWindows: [claudeWindow("secondary", 0.22)],
+    proxy: { scheme: "socks5", host: "proxy.invalid:1080" },
+  });
+  const choose = vi.fn(async () => codex.id);
+  const action = app.composerCustomizations[0]!.experimental_popups![0]!;
+  const slot = renderSlot(
+    action,
+    {},
+    {
+      composer: {
+        scope: { kind: "thread", threadId: "one" },
+        selection: { providerId: "codex" },
+      },
+      sdk: {
+        threads: {
+          get: async () => makeThreadResponse({ providerId: "codex" }),
+        },
+      },
+      rpc: {
+        "status.get": () =>
+          status([
+            codex,
+            account({
+              id: "22222222-2222-4222-8222-222222222222",
+              label: "Direct account",
+            }),
+          ]),
+        "account.proxyExit": () => ({ country: "DE", ip: "192.0.2.1" }),
+        "thread.choice": () => null,
+        "thread.choose": choose,
+      },
+    },
+  );
+  const flag = await slot.findByRole("img", {
+    name: "Страна прокси: Германия",
+  });
+  expect(flag.tagName).toBe("IMG");
+  expect(flag.getAttribute("src")).toMatch(/^data:image\/png;base64,/);
+  expect(flag.closest("button")).toBe(
+    slot.getByRole("button", { name: /22%/ }),
+  );
+  expect(
+    slot
+      .getByRole("button", { name: "Direct account" })
+      .querySelector('img[alt^="Страна прокси"]'),
+  ).toBeNull();
+  expect(
+    slot.rpcCalls.filter((call) => call.method === "account.proxyExit"),
+  ).toEqual([{ method: "account.proxyExit", input: { id: codex.id } }]);
+  fireEvent.click(slot.getByRole("button", { name: /22%/ }));
+  await waitFor(() =>
+    expect(choose).toHaveBeenCalledWith({
+      threadId: "one",
+      accountId: codex.id,
+    }),
+  );
+});
+
+it("sends a new thread draft with the explicitly selected account from the plus menu", async () => {
+  const codex = account({ provider: "codex" });
+  const registration = app.composerCustomizations[0]!;
+  const popup = registration.experimental_popups![0]!;
+  expect(registration.scopes).toContain("new-thread");
+  const slot = renderSlot(
+    popup,
+    {},
+    {
+      composer: {
+        scope: { kind: "new-thread", projectId: null },
+        selection: { providerId: "codex" },
+        text: "hello",
+      },
+      rpc: { "status.get": () => status([codex]) },
+    },
+  );
+  expect(registration.plusMenu![0]!.label).toBe("Аккаунт");
+  fireEvent.click(
+    await slot.findByRole("button", { name: new RegExp(codex.label) }),
+  );
+  await waitFor(() =>
+    expect(
+      slot.getByRole("button", { name: "Отправить" }).hasAttribute("disabled"),
+    ).toBe(false),
+  );
+  fireEvent.click(slot.getByRole("button", { name: "Отправить" }));
+  await waitFor(() =>
+    expect(slot.inspection.composer.submits).toEqual([
+      { experimental_data: { accountId: codex.id } },
+    ]),
+  );
+});
+
+it("hands an existing Codex draft to a Claude account and keeps the original chat binding", async () => {
+  const claude = account();
+  const slot = renderSlot(
+    app.composerCustomizations[0]!.experimental_popups![0]!,
+    {},
+    {
+      composer: {
+        scope: { kind: "thread", threadId: "source" },
+        selection: { providerId: "codex", model: "test-model" },
+        text: "continue",
+      },
+      sdk: {
+        threads: {
+          get: async () => makeThreadResponse({ providerId: "codex" }),
+        },
+      },
+      rpc: {
+        "status.get": () => status([claude]),
+        "thread.choice": () => null,
+      },
+    },
+  );
+  fireEvent.click(
+    await slot.findByRole("button", { name: new RegExp(claude.label) }),
+  );
+  fireEvent.click(
+    await slot.findByRole("button", { name: "Продолжить в новом чате" }),
+  );
+  await waitFor(() =>
+    expect(slot.inspection.composer.submits).toEqual([
+      { experimental_data: { accountId: claude.id } },
+    ]),
+  );
+  expect(slot.inspection.composer.selections).toEqual([
+    { providerId: "claude-code" },
+  ]);
+});
 
 describe("Account Pool parent banner", () => {
   const PARENT_URL = "http://127.0.0.1:25231/api/v1/plugins/account-pool/http";
@@ -414,9 +549,33 @@ describe("Account Pool settings", () => {
 
   it("shows the public proxy address in account details and saves a replacement", async () => {
     const current = account({
-      proxy: { scheme: "socks5", host: "proxy.invalid:1080" },
+      proxy: {
+        scheme: "socks5",
+        host: "proxy.invalid:1080",
+        authenticated: true,
+      },
     });
-    const slot = render([current], { "account.setProxy": () => current });
+    const slot = render([current], {
+      "account.setProxy": () => current,
+      "account.saveProxyFields": () => current,
+      "account.proxyExit": () => ({ ip: "192.0.2.1", country: "NL" }),
+      "account.checkProxyFields": () => ({
+        connected: true,
+        status: 403,
+        elapsedMs: 15,
+        message: "Ответ получен.",
+      }),
+    });
+    const country = await slot.findByText("Нидерланды");
+    expect(country.querySelector("img")?.getAttribute("src")).toMatch(
+      /^data:image\/png;base64,/,
+    );
+    expect(country.parentElement?.textContent).toBe(
+      "Прокси · Нидерланды · 192.0.2.1",
+    );
+    expect(
+      slot.rpcCalls.filter((call) => call.method === "account.proxyExit"),
+    ).toHaveLength(1);
     fireEvent.click(
       await slot.findByRole("button", {
         name: "Open person@example.com details",
@@ -428,18 +587,33 @@ describe("Account Pool settings", () => {
       await slot.findByRole("button", { name: "person@example.com actions" }),
     );
     fireEvent.click(await slot.findByText("Set proxy…"));
-    const input = await slot.findByLabelText("Proxy address");
-    expect(input).toHaveProperty("value", "");
-    expect(input).toHaveProperty(
+    const host = await slot.findByLabelText("IP или хост");
+    expect(host).toHaveProperty("value", "proxy.invalid");
+    expect(slot.getByLabelText("Порт")).toHaveProperty("value", "1080");
+    expect(slot.getByLabelText("Пароль")).toHaveProperty(
       "placeholder",
-      "http://, https:// or socks5://",
+      "••••••••",
     );
-    const proxy = "http://user:pass@proxy.invalid:8080";
-    fireEvent.change(input, { target: { value: proxy } });
+    expect(slot.getByLabelText("Логин")).toHaveProperty("type", "password");
+    fireEvent.click(slot.getByRole("button", { name: "Проверить соединение" }));
+    expect(await slot.findByText(/Ответ получен.*HTTP 403/u)).toBeTruthy();
+    fireEvent.change(slot.getByLabelText("Пароль"), {
+      target: { value: "new pass" },
+    });
+    expect(slot.queryByText(/Ответ получен/u)).toBeNull();
     fireEvent.click(slot.getByRole("button", { name: "Save" }));
     expect(slot.rpcCalls).toContainEqual({
-      method: "account.setProxy",
-      input: { id: current.id, proxy },
+      method: "account.saveProxyFields",
+      input: {
+        id: current.id,
+        fields: {
+          scheme: "socks5",
+          host: "proxy.invalid",
+          port: "1080",
+          user: null,
+          password: "new pass",
+        },
+      },
     });
     await waitFor(() =>
       expect(slot.queryByRole("dialog", { name: "Set proxy" })).toBeNull(),
@@ -461,7 +635,7 @@ describe("Account Pool settings", () => {
     });
     fireEvent.click(actions);
     fireEvent.click(await slot.findByText("Set proxy…"));
-    expect(await slot.findByLabelText("Proxy address")).toHaveProperty(
+    expect(await slot.findByLabelText("IP или хост")).toHaveProperty(
       "value",
       "",
     );
@@ -513,9 +687,16 @@ describe("Account Pool settings", () => {
     fireEvent.click(
       await slot.findByText("Sign in to Claude", { selector: "span.block" }),
     );
-    fireEvent.change(await slot.findByLabelText("Proxy (optional)"), {
-      target: { value: "http://user:pass@proxy.invalid:3128" },
-    });
+    for (const [label, value] of [
+      ["IP или хост", "proxy.invalid"],
+      ["Порт", "3128"],
+      ["Логин", "user"],
+      ["Пароль", "pass"],
+    ] as const) {
+      fireEvent.change(await slot.findByLabelText(label), {
+        target: { value },
+      });
+    }
     fireEvent.click(slot.getByRole("button", { name: "Continue" }));
     expect(slot.rpcCalls).toContainEqual({
       method: "login.start",
@@ -619,7 +800,11 @@ describe("Account Pool settings", () => {
     const slot = render([account()], {
       "config.set": () => nextConfig,
     });
+    expect(slot.queryByRole("combobox", { name: "Режим ротации" })).toBeNull();
     fireEvent.click(await slot.findByRole("button", { name: "Advanced" }));
+    expect(
+      await slot.findByRole("combobox", { name: "Режим ротации" }),
+    ).toBeTruthy();
     const anthropic = await slot.findByLabelText("Anthropic upstream base URL");
     if (!(anthropic instanceof HTMLInputElement)) {
       throw new Error("Expected the Anthropic config field to be an input.");

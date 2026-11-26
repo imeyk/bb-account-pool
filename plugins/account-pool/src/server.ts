@@ -131,10 +131,9 @@ export function createAccountPoolPlugin(
       "secrets",
       "accounts",
     );
-    const transport =
-      options.fetch === undefined ? createUpstreamTransport() : null;
+    const transport = createUpstreamTransport();
     const forgetProxy = (url: string) => {
-      void transport?.forget(url).catch(() => {});
+      void transport.forget(url).catch(() => {});
     };
     const accounts = new AccountStore(bb.storage.kv, secretDir, forgetProxy);
     await accounts.initialize();
@@ -158,11 +157,17 @@ export function createAccountPoolPlugin(
         quotas.put({ ...quota, error: null });
       }
     }
-    const upstreamFetch = options.fetch ?? transport?.fetch ?? fetch;
+    const upstreamFetch = options.fetch ?? transport.fetch;
     const fetchVia =
-      options.fetchVia ?? transport?.fetchVia ?? (() => upstreamFetch);
-    const fetchFor = async (account: Account) =>
-      fetchVia(await accounts.readAccountProxy(account.id));
+      options.fetchVia ??
+      ((proxy: string | null) =>
+        proxy === null ? upstreamFetch : transport.fetchVia(proxy));
+    const fetchFor = async (account: Account, requireProxy = false) => {
+      const proxy = await accounts.readAccountProxy(account.id);
+      if (requireProxy && proxy === null)
+        throw new AccountProxyUnreadableError(account.id);
+      return fetchVia(proxy);
+    };
     const hub = createHub({
       accounts,
       quotas,
@@ -180,6 +185,8 @@ export function createAccountPoolPlugin(
       drainTimeoutMs: options.drainTimeoutMs,
       maxAffinityBindings: options.maxAffinityBindings,
       getParentRoute: proxyingParent,
+      rotationMode: () => routing.rotationMode(),
+      threadChoice: (id) => routing.threadChoice(id),
       onUpstreamError: (provider, error) =>
         bb.log.warn(
           `Account Pooler ${provider} transport failed: ${transportErrorCode(error)}.`,
@@ -192,12 +199,10 @@ export function createAccountPoolPlugin(
         else bb.log.warn(message);
       },
     });
-    if (transport !== null) {
-      bb.onDispose(async () => {
-        await hub.stop();
-        await transport.destroy();
-      });
-    }
+    bb.onDispose(async () => {
+      await hub.stop();
+      await transport.destroy();
+    });
     const availability =
       parentPool === null
         ? null
@@ -234,6 +239,8 @@ export function createAccountPoolPlugin(
       () => bb.realtime.publish(ACCOUNT_POOL_ACCOUNTS_CHANGED, {}),
       (accountId) => hub.refreshUsage(accountId, true),
       parentStatus,
+      fetchVia,
+      options.fetchVia,
     );
     const fetchForTarget = async (
       provider: PoolProvider,
@@ -314,6 +321,38 @@ export function createAccountPoolPlugin(
       createRpcHandlers(operations, login, codexLogin, config),
     );
     registerPoolCli(bb, operations, login, codexLogin, config);
+    bb.experimental_hooks.on("message.dispatch", async (context) => {
+      const submission = context.experimental_submission;
+      if (submission?.pluginId !== bb.pluginId) return { action: "proceed" };
+      const choice = z
+        .object({ accountId: z.string().uuid() })
+        .strict()
+        .safeParse(submission.data);
+      const provider =
+        context.thread.providerId === "claude-code"
+          ? "claude"
+          : context.thread.providerId;
+      if (!choice.success || (provider !== "codex" && provider !== "claude")) {
+        return {
+          action: "reject",
+          message: "Выберите доступный аккаунт провайдера.",
+        };
+      }
+      try {
+        await operations.setThreadChoice(
+          context.thread.id,
+          choice.data.accountId,
+          provider,
+        );
+        return { action: "proceed" };
+      } catch (error) {
+        return {
+          action: "reject",
+          message:
+            error instanceof Error ? error.message : "Ошибка выбора аккаунта.",
+        };
+      }
+    });
     const canServe = async (provider: PoolProvider): Promise<boolean> => {
       if (!(await operations.isRoutingEnabled(provider))) return false;
       if (proxyingParent() !== null && availability !== null) {
@@ -343,13 +382,22 @@ export function createAccountPoolPlugin(
     const contributeFor =
       (
         provider: PoolProvider,
-        serving: (token: string) => Promise<PoolEnvEntry[]>,
+        serving: (
+          token: string,
+          threadId: string | null,
+        ) => Promise<PoolEnvEntry[]>,
       ) =>
       async (context: { threadId: string | null; hostId: string }) => {
         const { threadId } = context;
         const bypassed =
           threadId !== null && (await routing.isBypassed(threadId));
-        if (!bypassed && (await canServe(provider))) {
+        const manualLocalChoice =
+          !bypassed &&
+          threadId !== null &&
+          parentPool === null &&
+          (await operations.isRoutingEnabled(provider)) &&
+          (await routing.threadChoice(threadId)) !== null;
+        if (!bypassed && (manualLocalChoice || (await canServe(provider)))) {
           const token = await hubTokens.forHost(context.hostId);
           if (threadId !== null) {
             await bb.storage.kv.set(`retry-route:${threadId}`, provider);
@@ -357,7 +405,7 @@ export function createAccountPoolPlugin(
               await routing.recordRouted(threadId, context.hostId);
             }
           }
-          return [...(await serving(token)), ...markerEntries(token)];
+          return [...(await serving(token, threadId)), ...markerEntries(token)];
         }
         if (threadId !== null) {
           await bb.storage.kv.delete(`retry-route:${threadId}`);
@@ -388,7 +436,7 @@ export function createAccountPoolPlugin(
         : null;
     bb.providers.experimental_contributeEnv(
       "claude-code",
-      contributeFor("claude", async (token) => [
+      contributeFor("claude", async (token, threadId) => [
         {
           name: "ANTHROPIC_BASE_URL",
           value: { serverPath: HUB_BASE_PATH },
@@ -396,7 +444,7 @@ export function createAccountPoolPlugin(
         },
         {
           name: "ANTHROPIC_AUTH_TOKEN",
-          value: token,
+          value: threadId && !proxyingParent() ? `${token}.${threadId}` : token,
           reason: "Account Pooler hub token for this machine",
         },
         {
@@ -431,7 +479,7 @@ export function createAccountPoolPlugin(
     );
     bb.providers.experimental_contributeEnv(
       "codex",
-      contributeFor("codex", async (token) => [
+      contributeFor("codex", async (token, threadId) => [
         {
           name: "CODEX_OPENAI_BASE_URL",
           value: { serverPath: `${HUB_BASE_PATH}/v1` },
@@ -439,7 +487,7 @@ export function createAccountPoolPlugin(
         },
         {
           name: "CODEX_POOL_AUTH_TOKEN",
-          value: token,
+          value: threadId && !proxyingParent() ? `${token}.${threadId}` : token,
           reason: "Account Pooler hub token for this machine",
         },
       ]),

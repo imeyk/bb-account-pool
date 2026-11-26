@@ -25,8 +25,12 @@ import {
 import { CSS } from "@dnd-kit/utilities";
 import {
   definePluginApp,
+  experimental_ProviderIcon as ProviderIcon,
+  experimental_useProviders,
   experimental_copyToClipboard,
   useBbNavigate,
+  useComposer,
+  useSdk,
   useRealtime,
   useRpc,
 } from "@get-bb/plugin-sdk/app";
@@ -56,6 +60,13 @@ import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
 import { ResourceRowDetailChevron } from "@/components/ui/resource-list";
 import { Switch } from "@/components/ui/switch";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 import type {
   AccountSummary,
   AccountPoolConfig,
@@ -68,15 +79,22 @@ import type {
   PoolAvailability,
   PoolProvider,
   PoolStatus,
+  ProxyCheckResult,
+  ProxyFields,
+  ProxyExit,
 } from "./src/contracts.js";
 import type { accountPoolRpcContract } from "./src/rpc.js";
 import type { OAuthLoginStart } from "./src/oauth-login.js";
 import type { CodexDeviceLoginStart } from "./src/codex-device-login.js";
+import countryFlagImages from "./src/flags/countries.json";
 import {
   DEFAULT_ACCOUNT_POOL_CONFIG,
   limitWindowSlotSchema,
   modelFamilySchema,
   proxyUrlSchema,
+  proxyFieldsSchema,
+  proxySchemeSchema,
+  rotationModeSchema,
   statusSchema,
 } from "./src/contracts.js";
 import { blockingResetAt } from "./src/quota.js";
@@ -282,13 +300,46 @@ function SettingsBadge({ children }: { children: ReactNode }) {
   );
 }
 
+function agentProviderId(provider: string): string {
+  return provider === "claude" ? "claude-code" : provider;
+}
+
+function ProviderLabel({
+  provider,
+  title,
+}: {
+  provider: PoolProvider;
+  title?: string;
+}) {
+  const { providers } = experimental_useProviders();
+  const id = agentProviderId(provider);
+  const entry = providers.find((item) => item.id === id);
+  return (
+    <span className="inline-flex items-center gap-1.5">
+      <ProviderIcon
+        providerKind="agent"
+        provider={entry ?? { id }}
+        fallback="Bot"
+        className="size-4 shrink-0"
+        aria-hidden="true"
+      />
+      <span>
+        {title ??
+          entry?.displayName ??
+          PROVIDERS.find((item) => item.id === provider)?.title ??
+          provider}
+      </span>
+    </span>
+  );
+}
+
 function SettingsSection({
   title,
   description,
   action,
   children,
 }: {
-  title: string;
+  title: ReactNode;
   description: string;
   action: ReactNode;
   children: ReactNode;
@@ -502,6 +553,13 @@ function AccountRow({
                 <span className={cn("size-1.5 rounded-full", status.dot)} />
                 {status.label}
               </span>
+              {account.proxy ? (
+                <ProxyLocation
+                  key={account.proxy.scheme + account.proxy.host}
+                  id={account.id}
+                  fallback={account.proxy.host}
+                />
+              ) : null}
               {account.lastUsedAt === null ? null : (
                 <span>used {relative(account.lastUsedAt)}</span>
               )}
@@ -826,27 +884,168 @@ function AuthorizationUrlRow({
   );
 }
 
+function initialProxy(saved: AccountSummary["proxy"] = null): ProxyFields {
+  const url = saved && new URL(`${saved.scheme}://${saved.host}`);
+  const scheme = saved?.scheme ?? "http";
+  return {
+    scheme,
+    host: url?.hostname ?? "",
+    port: url
+      ? url.port ||
+        (scheme === "http" ? "80" : scheme === "https" ? "443" : "1080")
+      : "",
+    user: saved?.authenticated ? null : "",
+    password: saved?.authenticated ? null : "",
+  };
+}
+
 function ProxyInput({
-  optional = false,
-  value,
-  onChange,
+  fields,
+  change,
 }: {
-  optional?: boolean;
-  value: string;
-  onChange: (value: string) => void;
+  fields: ProxyFields;
+  change: (fields: ProxyFields) => void;
 }) {
-  const label = optional ? "Proxy (optional)" : "Proxy address";
   return (
-    <label className="grid gap-2 text-sm font-medium">
-      {label}
-      <Input
-        type="password"
-        autoComplete="off"
-        placeholder="http://, https:// or socks5://"
-        value={value}
-        onChange={(event) => onChange(event.target.value)}
-      />
-    </label>
+    <div className="grid grid-cols-2 gap-3">
+      <label className="col-span-2 grid gap-1 text-sm">
+        Тип прокси
+        <Select
+          value={fields.scheme}
+          onValueChange={(v) =>
+            change({ ...fields, scheme: proxySchemeSchema.parse(v) })
+          }
+        >
+          <SelectTrigger aria-label="Тип прокси">
+            <SelectValue />
+          </SelectTrigger>
+          <SelectContent>
+            {proxySchemeSchema.options.map((v) => (
+              <SelectItem key={v} value={v}>
+                {v.toUpperCase()}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </label>
+      {(["host", "port", "user", "password"] as const).map((key) => {
+        const secret = key === "user" || key === "password";
+        return (
+          <label key={key} className="grid gap-1 text-sm">
+            {
+              {
+                host: "IP или хост",
+                port: "Порт",
+                user: "Логин",
+                password: "Пароль",
+              }[key]
+            }
+            <Input
+              type={secret ? "password" : "text"}
+              autoComplete="off"
+              inputMode={key === "port" ? "numeric" : undefined}
+              value={fields[key] ?? ""}
+              placeholder={fields[key] === null ? "••••••••" : undefined}
+              onChange={(event) =>
+                change({ ...fields, [key]: event.target.value })
+              }
+            />
+          </label>
+        );
+      })}
+      {fields.user === null || fields.password === null ? (
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => change({ ...fields, user: "", password: "" })}
+        >
+          Очистить логин и пароль
+        </Button>
+      ) : null}
+    </div>
+  );
+}
+
+function useProxyExit(id: string) {
+  const rpc = useRpc<typeof accountPoolRpcContract>();
+  const [exit, setExit] = useState<ProxyExit | undefined>(undefined);
+  useEffect(() => {
+    let active = true;
+    const refresh = () => {
+      void rpc.call("account.proxyExit", { id }).then(
+        (value) => {
+          if (active) setExit(value);
+        },
+        () => {
+          if (active) setExit(null);
+        },
+      );
+    };
+    refresh();
+    const timer = setInterval(refresh, 300000);
+    return () => {
+      active = false;
+      clearInterval(timer);
+    };
+  }, [id, rpc]);
+  return exit;
+}
+
+const countryNames = new Intl.DisplayNames(["ru"], {
+  type: "region",
+  fallback: "none",
+});
+
+const flagImages: Readonly<Record<string, string>> = countryFlagImages;
+
+function CountryFlag({
+  country,
+  decorative = false,
+}: {
+  country?: string;
+  decorative?: boolean;
+}) {
+  if (!country || !/^[A-Z]{2}$/.test(country) || country === "ZZ") return null;
+  const name = countryNames.of(country);
+  if (!name) return null;
+  const src = flagImages[country];
+  if (!src) return null;
+  const label = `Страна прокси: ${name}`;
+  return (
+    <img
+      src={src}
+      width={16}
+      height={12}
+      className="shrink-0"
+      alt={decorative ? "" : label}
+      title={label}
+    />
+  );
+}
+
+function ProxyCountryFlag({ id }: { id: string }) {
+  const exit = useProxyExit(id);
+  return <CountryFlag country={exit?.country} />;
+}
+
+function ProxyLocation({ id, fallback }: { id: string; fallback: string }) {
+  const exit = useProxyExit(id);
+  return (
+    <span className="break-all">
+      {exit ? (
+        <>
+          Прокси ·{" "}
+          <span className="inline-flex items-center gap-1 align-middle">
+            <CountryFlag country={exit.country} decorative />
+            {countryNames.of(exit.country) ?? exit.country}
+          </span>
+          {" · "}
+          {exit.ip}
+        </>
+      ) : (
+        `Прокси · ${fallback} · ${exit === undefined ? "проверяется" : "выходной IP неизвестен"}`
+      )}
+    </span>
   );
 }
 
@@ -883,6 +1082,72 @@ function DialogFrame({
         </DialogFooter>
       )}
     </DialogContent>
+  );
+}
+
+function ProxyCheck({
+  account,
+  draft,
+}: {
+  account: AccountSummary;
+  draft: ProxyFields;
+}) {
+  const rpc = useRpc<typeof accountPoolRpcContract>();
+  const [checking, setChecking] = useState(false);
+  const [result, setResult] = useState<ProxyCheckResult | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const available = proxyFieldsSchema.safeParse(draft).success;
+  async function check() {
+    setChecking(true);
+    setError(null);
+    setResult(null);
+    try {
+      setResult(
+        await rpc.call("account.checkProxyFields", {
+          id: account.id,
+          fields: draft,
+        }),
+      );
+    } catch (cause) {
+      setError(errorText(cause));
+    } finally {
+      setChecking(false);
+    }
+  }
+  return (
+    <div className="space-y-2">
+      {account.proxy ? (
+        <p className="break-all text-xs text-muted-foreground">
+          Сохранённый прокси: {account.proxy.scheme}://{account.proxy.host}
+        </p>
+      ) : null}
+      <Button
+        variant="outline"
+        size="sm"
+        disabled={!available || checking}
+        onClick={() => void check()}
+      >
+        {checking ? "Проверяется соединение…" : "Проверить соединение"}
+      </Button>
+      <p
+        role="status"
+        className={cn(
+          "text-xs",
+          error || result?.connected === false
+            ? "text-destructive-text"
+            : "text-muted-foreground",
+        )}
+      >
+        {error ??
+          (result
+            ? `${result.message} ${result.status === null ? "" : `HTTP ${result.status}. `}${result.elapsedMs} мс.`
+            : available
+              ? "Проверяется введённый адрес без сохранения."
+              : account.proxy
+                ? "Для проверки будет использован сохранённый адрес."
+                : "Введите адрес прокси для проверки.")}
+      </p>
+    </div>
   );
 }
 
@@ -960,7 +1225,29 @@ function AccountPoolSettings() {
   const [loginDone, setLoginDone] = useState<string | null>(null);
   const [pastedCode, setPastedCode] = useState("");
   const [apiKey, setApiKey] = useState("");
-  const [proxy, setProxy] = useState("");
+  const [fields, setFields] = useState<ProxyFields>(() => initialProxy());
+  const [proxyRevision, setProxyRevision] = useState(0);
+  function editProxy(next: ProxyFields) {
+    setFields(next);
+    setProxyRevision((n) => n + 1);
+  }
+  const blankProxy =
+    !fields.host && !fields.port && !fields.user && !fields.password;
+  const credentials =
+    fields.user || fields.password
+      ? `${encodeURIComponent(fields.user ?? "")}:${encodeURIComponent(fields.password ?? "")}@`
+      : "";
+  const proxyHost =
+    fields.host.includes(":") && !fields.host.startsWith("[")
+      ? `[${fields.host}]`
+      : fields.host;
+  const proxy = blankProxy
+    ? ""
+    : `${fields.scheme}://${credentials}${proxyHost}:${fields.port}`;
+  const invalidNewProxy =
+    !blankProxy &&
+    (!proxyFieldsSchema.safeParse(fields).success ||
+      !proxyUrlSchema.safeParse(proxy).success);
   const [priority, setPriority] = useState("100");
   const [countdown, setCountdown] = useState(0);
   const mounted = useRef(true);
@@ -1172,7 +1459,7 @@ function AccountPoolSettings() {
     provider: PoolProvider,
     choice: "login" | "api-key",
   ): void {
-    setProxy("");
+    setFields(initialProxy());
     setError(null);
     setDialog(
       choice === "login"
@@ -1196,7 +1483,7 @@ function AccountPoolSettings() {
       return;
     }
     if (action === "proxy") {
-      setProxy("");
+      setFields(initialProxy(account.proxy));
       setError(null);
       setDialog({ kind: "proxy", accountId: account.id });
       return;
@@ -1249,7 +1536,7 @@ function AccountPoolSettings() {
     setLoginStep(null);
     setCodexStep(null);
     setLoginDone(null);
-    setProxy("");
+    setFields(initialProxy());
     setError(null);
   }
   const hubHosts =
@@ -1346,7 +1633,9 @@ function AccountPoolSettings() {
           return (
             <SettingsSection
               key={provider.id}
-              title={provider.title}
+              title={
+                <ProviderLabel provider={provider.id} title={provider.title} />
+              }
               description={provider.description}
               action={
                 <div className="flex items-center gap-2">
@@ -1438,6 +1727,41 @@ function AccountPoolSettings() {
           </CollapsibleTrigger>
           <CollapsibleContent>
             <div className="divide-y divide-border border-t border-border">
+              <ConfigFieldRow
+                label="Режим ротации"
+                description="Как выбирать аккаунт в режиме Авто для новых диалогов Codex и Claude. Текущий диалог сохраняет привязку к аккаунту."
+                error={null}
+              >
+                <Select
+                  disabled={
+                    status === null ||
+                    statusIsCached ||
+                    pending.has("rotation-mode")
+                  }
+                  value={status?.rotationMode ?? "weekly"}
+                  onValueChange={(value) =>
+                    void run("rotation-mode", async () => {
+                      await rpc.call(
+                        "routing.setRotationMode",
+                        rotationModeSchema.parse(value),
+                      );
+                    })
+                  }
+                >
+                  <SelectTrigger
+                    aria-label="Режим ротации"
+                    className="h-8 w-full"
+                  >
+                    <SelectValue />
+                  </SelectTrigger>
+                  <SelectContent align="end">
+                    <SelectItem value="weekly">
+                      Наименьший недельный расход
+                    </SelectItem>
+                    <SelectItem value="sequential">По приоритету</SelectItem>
+                  </SelectContent>
+                </Select>
+              </ConfigFieldRow>
               <ConfigFieldRow
                 label="Anthropic upstream base URL"
                 description="QA override for Anthropic traffic."
@@ -1623,17 +1947,30 @@ function AccountPoolSettings() {
                 </Button>
                 <Button
                   disabled={
-                    proxy.length === 0 ||
+                    !proxyFieldsSchema.safeParse(fields).success ||
                     pending.has(`proxy-${selectedAccount.id}`)
                   }
-                  onClick={() => saveProxy(selectedAccount.id, proxy)}
+                  onClick={() =>
+                    void run(`proxy-${selectedAccount.id}`, async () => {
+                      await rpc.call("account.saveProxyFields", {
+                        id: selectedAccount.id,
+                        fields,
+                      });
+                      closeDialog();
+                    })
+                  }
                 >
                   Save
                 </Button>
               </>
             }
           >
-            <ProxyInput value={proxy} onChange={setProxy} />
+            <ProxyInput fields={fields} change={editProxy} />
+            <ProxyCheck
+              key={`${selectedAccount.id}:${proxyRevision}`}
+              account={selectedAccount}
+              draft={fields}
+            />
             {error === null ? null : (
               <p role="alert" className="text-sm text-destructive">
                 {error}
@@ -1656,10 +1993,7 @@ function AccountPoolSettings() {
                 </Button>
                 <Button
                   onClick={() => {
-                    if (
-                      proxy.length > 0 &&
-                      !proxyUrlSchema.safeParse(proxy).success
-                    ) {
+                    if (invalidNewProxy) {
                       setError(
                         "Enter a valid proxy URL with http://, https:// or socks5://.",
                       );
@@ -1669,7 +2003,7 @@ function AccountPoolSettings() {
                       ...NEW_LOGIN,
                       ...(proxy.length === 0 ? {} : { proxy }),
                     });
-                    setProxy("");
+                    setFields(initialProxy());
                   }}
                 >
                   Continue
@@ -1678,7 +2012,7 @@ function AccountPoolSettings() {
             }
           >
             <StepIndicator step={1} />
-            <ProxyInput optional value={proxy} onChange={setProxy} />
+            <ProxyInput fields={fields} change={editProxy} />
             {error === null ? null : (
               <p role="alert" className="text-sm text-destructive">
                 {error}
@@ -1697,7 +2031,9 @@ function AccountPoolSettings() {
                 </Button>
                 <Button
                   disabled={
-                    apiKey.trim().length === 0 || pending.has("api-key")
+                    invalidNewProxy ||
+                    apiKey.trim().length === 0 ||
+                    pending.has("api-key")
                   }
                   onClick={() =>
                     void run("api-key", async () => {
@@ -1730,7 +2066,7 @@ function AccountPoolSettings() {
               value={apiKey}
               onChange={(event) => setApiKey(event.target.value)}
             />
-            <ProxyInput optional value={proxy} onChange={setProxy} />
+            <ProxyInput fields={fields} change={editProxy} />
             {error === null ? null : (
               <p role="alert" className="text-sm text-destructive">
                 {error}
@@ -2113,7 +2449,260 @@ function LoginDialog({
   );
 }
 
+function AccountChoice({ threadId }: { threadId: string | null }) {
+  const composer = useComposer();
+  const sdk = useSdk();
+  const rpc = useRpc<typeof accountPoolRpcContract>();
+  const [status, setStatus] = useState<PoolStatus | null>(null);
+  const [originalProvider, setOriginalProvider] = useState<string | null>(null);
+  const [choice, setChoice] = useState<string | null>(null);
+  const [busy, setBusy] = useState(true);
+  const [error, setError] = useState("");
+  useEffect(() => {
+    let active = true;
+    Promise.all([
+      rpc.call("status.get", null),
+      threadId ? rpc.call("thread.choice", { threadId }) : null,
+      threadId ? sdk.threads.get({ threadId }) : null,
+    ])
+      .then(([pool, saved, thread]) => {
+        if (!active) return;
+        setStatus(pool);
+        setChoice(saved);
+        setOriginalProvider(thread?.providerId ?? null);
+        setBusy(false);
+      })
+      .catch((reason) => {
+        if (active) setError(String(reason));
+      });
+    return () => {
+      active = false;
+    };
+  }, [rpc, sdk, threadId]);
+
+  async function run(action: () => Promise<void>) {
+    setBusy(true);
+    setError("");
+    try {
+      await action();
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : String(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+  const providerId = (account: AccountSummary) =>
+    agentProviderId(account.provider);
+  const selected = status?.accounts.find((a) => a.id === choice);
+  const switchThread = Boolean(
+    threadId && selected && providerId(selected) !== originalProvider,
+  );
+  const locked = busy || composer.isRunning;
+  async function choose(account: AccountSummary | null) {
+    if (threadId && (!account || providerId(account) === originalProvider)) {
+      if (account && composer.selection?.providerId !== originalProvider) {
+        const settled = await composer.setSelection({
+          providerId: providerId(account),
+        });
+        if (settled.providerId !== originalProvider)
+          throw new Error("Провайдер недоступен на этой машине.");
+      }
+      await rpc.call("thread.choose", {
+        threadId,
+        accountId: account?.id ?? null,
+      });
+      composer.experimental_closePopup();
+    }
+    setChoice(account?.id ?? null);
+  }
+  return (
+    <div
+      className="flex w-full min-w-0 flex-col gap-1 p-1.5"
+      aria-label="Выбор аккаунта"
+    >
+      <Button
+        variant="ghost"
+        size="sm"
+        className="w-full justify-start gap-2"
+        disabled={locked}
+        aria-pressed={choice === null}
+        onClick={() => void run(() => choose(null))}
+      >
+        <Icon name="Layers" />
+        Авто
+        {choice === null && (
+          <Icon name="Check" className="ml-auto text-primary" />
+        )}
+      </Button>
+      {Array.from(
+        new Set(status?.accounts.map((account) => account.provider)),
+      ).map((provider) => {
+        const accounts =
+          status?.accounts.filter((a) => a.provider === provider) ?? [];
+        if (!accounts.length || !status) return null;
+        const routed = status.routing[provider];
+        return (
+          <section key={provider} className="border-t pt-1">
+            <div className="flex items-center justify-between px-2 py-1 text-xs text-muted-foreground">
+              <ProviderLabel provider={provider} />
+              {!routed && (
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  disabled={locked}
+                  onClick={() =>
+                    void run(async () => {
+                      await rpc.call("routing.set", {
+                        provider,
+                        enabled: true,
+                      });
+                      setStatus(await rpc.call("status.get", null));
+                    })
+                  }
+                >
+                  Включить пул
+                </Button>
+              )}
+            </div>
+            {accounts.map((a) => {
+              const weekly = a.limitWindows.find(
+                (w) => w.windowMinutes === 10080,
+              )?.utilization;
+              return (
+                <div className="flex min-w-0 items-center" key={a.id}>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="min-w-0 flex-1 justify-start gap-2"
+                    disabled={locked || !a.enabled || !routed}
+                    aria-pressed={choice === a.id}
+                    onClick={() => void run(() => choose(a))}
+                  >
+                    <Icon name="UserRound" />
+                    <span className="truncate">{a.label}</span>
+                    {a.proxy && (
+                      <ProxyCountryFlag
+                        key={a.proxy.scheme + a.proxy.host}
+                        id={a.id}
+                      />
+                    )}
+                    {weekly != null && (
+                      <span className="ml-auto text-xs tabular-nums text-muted-foreground">
+                        {Math.round(weekly * 100)}%
+                      </span>
+                    )}
+                    {choice === a.id && (
+                      <Icon name="Check" className="text-primary" />
+                    )}
+                  </Button>
+                  {!a.enabled && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      disabled={locked}
+                      aria-label={`Включить аккаунт ${a.label}`}
+                      onClick={() =>
+                        void run(async () => {
+                          await rpc.call("account.enable", { id: a.id });
+                          setStatus(await rpc.call("status.get", null));
+                        })
+                      }
+                    >
+                      Включить
+                    </Button>
+                  )}
+                </div>
+              );
+            })}
+          </section>
+        );
+      })}
+      {(threadId === null || switchThread) && (
+        <div className="flex flex-col gap-2 border-t p-2">
+          {switchThread && (
+            <p className="text-xs text-muted-foreground">
+              BB продолжит разговор в новом чате выбранного провайдера.
+            </p>
+          )}
+          <Button
+            size="sm"
+            disabled={
+              locked ||
+              composer.isSubmittingBlocked ||
+              (choice !== null && !selected?.enabled)
+            }
+            onClick={() =>
+              void run(async () => {
+                if (
+                  selected &&
+                  composer.selection?.providerId !== providerId(selected)
+                ) {
+                  const settled = await composer.setSelection({
+                    providerId: providerId(selected),
+                  });
+                  if (
+                    settled.providerId !== providerId(selected) ||
+                    !settled.model
+                  )
+                    throw new Error(
+                      "Для этого провайдера нет доступной модели.",
+                    );
+                }
+                await composer.submit(
+                  choice ? { experimental_data: { accountId: choice } } : {},
+                );
+                composer.experimental_closePopup();
+              })
+            }
+          >
+            {switchThread ? "Продолжить в новом чате" : "Отправить"}
+          </Button>
+        </div>
+      )}
+      {error && (
+        <p className="px-2 text-xs text-destructive" role="alert">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function ComposerChoice() {
+  const composer = useComposer();
+  if (composer.scope.kind === "queued-message") return null;
+  return (
+    <AccountChoice
+      key={composer.key}
+      threadId={
+        composer.scope.kind === "thread" ? composer.scope.threadId : null
+      }
+    />
+  );
+}
+
 export default definePluginApp((app) => {
+  app.composer.customize({
+    id: "codex-account",
+    scopes: ["thread", "new-thread"],
+    experimental_popups: [
+      {
+        id: "account-choice",
+        label: "Аккаунт",
+        component: ComposerChoice,
+      },
+    ],
+    plusMenu: [
+      {
+        id: "choose",
+        label: "Аккаунт",
+
+        run: ({ composer }) => {
+          composer.experimental_openPopup("account-choice");
+        },
+      },
+    ],
+  });
   app.slots.settingsSection({
     id: "accounts",
     component: AccountPoolSettings,

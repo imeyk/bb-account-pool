@@ -6,10 +6,16 @@ import type {
   HubTokenSummary,
   LoginTarget,
   PoolProvider,
+  ProxyCheckResult,
+  ProxyFields,
+  ProxyExit,
+  RotationMode,
   PoolStatus,
   RoutedThreadStatus,
 } from "./contracts.js";
 import type { AccountPoolHub } from "./hub.js";
+import { proxyUrlSchema } from "./contracts.js";
+import { checkProxyConnection, proxyExit } from "./upstream-transport.js";
 import type {
   AccountStore,
   HubTokenStore,
@@ -84,6 +90,8 @@ export class PoolOperations {
     private readonly parentStatus: () => Promise<
       PoolStatus["parent"]
     > = async () => null,
+    private readonly exitFetchVia: (proxy: string) => typeof fetch,
+    private readonly probeFetchVia?: (proxy: string) => typeof fetch,
   ) {}
 
   async add(input: AccountAddInput): Promise<Account> {
@@ -268,6 +276,64 @@ export class PoolOperations {
     return (await this.list()).find((account) => account.id === id) ?? null;
   }
 
+  async editorAddress(id: string, fields: ProxyFields): Promise<string> {
+    const host =
+      fields.host.includes(":") && !fields.host.startsWith("[")
+        ? `[${fields.host}]`
+        : fields.host;
+    const endpoint = new URL(`${fields.scheme}://${host}:${fields.port}`);
+    if (fields.user === null || fields.password === null) {
+      const saved = await this.accounts.readAccountProxy(id);
+      const previous = saved && new URL(saved);
+      if (previous && !previous.port && previous.protocol.startsWith("socks5"))
+        previous.port = "1080";
+      if (
+        !previous ||
+        endpoint.protocol !== previous.protocol ||
+        endpoint.host !== previous.host
+      )
+        throw new Error(
+          "Для другого адреса прокси введите логин и пароль заново.",
+        );
+      endpoint.username = previous.username;
+      endpoint.password = previous.password;
+    }
+    if (fields.user !== null)
+      endpoint.username = encodeURIComponent(fields.user);
+    if (fields.password !== null)
+      endpoint.password = encodeURIComponent(fields.password);
+    return proxyUrlSchema.parse(endpoint.href);
+  }
+
+  async proxyExit(id: string): Promise<ProxyExit> {
+    const saved = await this.accounts.readAccountProxy(id);
+    return saved ? proxyExit(this.exitFetchVia(saved)) : null;
+  }
+
+  async checkProxy(id: string, draft?: string): Promise<ProxyCheckResult> {
+    const account = await this.accounts.get(id);
+    if (account === null) throw new Error("Аккаунт не найден.");
+    const proxy = draft ?? (await this.accounts.readAccountProxy(id));
+    if (proxy === null) {
+      return {
+        connected: false,
+        status: null,
+        elapsedMs: 0,
+        message: "У аккаунта не задан прокси.",
+      };
+    }
+    return checkProxyConnection(account.provider, proxy, this.probeFetchVia);
+  }
+
+  rotationMode(): Promise<RotationMode> {
+    return this.routing.rotationMode();
+  }
+
+  async setRotationMode(mode: RotationMode): Promise<void> {
+    await this.routing.setRotationMode(mode);
+    this.onAccountsChanged();
+  }
+
   async setPriority(id: string, priority: number): Promise<Account | null> {
     const account = await this.accounts.setPriority(id, priority);
     if (account !== null) this.onAccountsChanged();
@@ -320,6 +386,7 @@ export class PoolOperations {
             ? null
             : (hostNames.get(account.lastUsedHostId) ?? null),
       })),
+      rotationMode: await this.rotationMode(),
       routing: { claude, codex },
       parent: await this.parentStatus(),
     };
@@ -341,6 +408,34 @@ export class PoolOperations {
     return { ...token, hostName: host.name };
   }
 
+  async threadChoice(threadId: string): Promise<string | null> {
+    return this.routing.threadChoice(threadId);
+  }
+
+  async setThreadChoice(
+    threadId: string,
+    accountId: string | null,
+    provider?: PoolProvider,
+  ): Promise<string | null> {
+    if (accountId !== null) {
+      const account = await this.accounts.get(accountId);
+      if (!account?.enabled)
+        throw new Error("Аккаунт отключён. Включите его перед выбором.");
+      if (provider && account.provider !== provider)
+        throw new Error("Выбранный аккаунт принадлежит другому провайдеру.");
+      if (
+        (await this.parentStatus())?.mode === "proxy" ||
+        (await this.routing.isBypassed(threadId)) ||
+        !(await this.routing.isProviderEnabled(account.provider))
+      )
+        throw new Error(
+          "Для этого чата требуется локальная маршрутизация через Account Pooler.",
+        );
+    }
+    await this.routing.setThreadChoice(threadId, accountId);
+    return this.routing.threadChoice(threadId);
+  }
+
   async setBypass(
     threadId: string,
     bypassed: boolean,
@@ -359,7 +454,11 @@ export class PoolOperations {
         await this.accounts.readSecret(account.id);
         return true;
       } catch {
-        continue;
+        try {
+          if (await this.accounts.readAccountProxy(account.id)) return true;
+        } catch {
+          return true;
+        }
       }
     }
     return false;

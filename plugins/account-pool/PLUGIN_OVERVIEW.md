@@ -14,26 +14,11 @@ The hub serves Anthropic Messages and OpenAI Responses endpoints. Routed provide
 
 The pool waits once on the same account for short temporary rate limits. Longer holds return Retry-After for pinned conversations while new conversations can advance. A model-family limit detours requests for that family without moving the session’s main pin or the provider cursor. Server, overload and connection errors retry a pinned account twice with backoff before failing over. The pool commits a new account after a successful response; failing everywhere keeps the old binding. The current account and pins survive hub restarts; pins expire after 30 idle minutes, and the 4,096 most recent are kept.
 
-The pool uses HTTP/1.1 and honors standard proxy environment variables. An
-account's own HTTP(S) or SOCKS5 proxy takes precedence for upstream requests, token
-refresh, usage, profile, and sign-in requests made by the server. Accounts
-with unreadable proxy settings are skipped. Connection failures log error
-codes without credentials or request contents.
+Each account can use its own HTTP(S) or SOCKS5 proxy for provider requests, sign-in, token refresh and usage. In the account menu, **Set proxy…** → **Проверить соединение** tests the saved or entered address. Use `bb pool account proxy-check <id> [--proxy-stdin]` from the CLI. Nested BB servers can use the parent pool.
 
-Both `socks5://` and `socks5h://` use undici's experimental
-`Socks5ProxyAgent` and send destination hostnames to the proxy for DNS
-resolution. Node emits an `ExperimentalWarning` on the first use of the
-agent in each process. Supply the proxy username and password together if
-the proxy requires credentials.
+Choose the rotation policy under **Advanced** → **Режим ротации** or with `bb pool rotation <weekly|sequential>`.
 
-## Nested bb servers
-
-A bb server started inside another bb server's thread detects the parent's pooler and enables this plugin. Choose in settings or with `bb pool parent`:
-
-- **proxy** (default): keep a local hub with its own machine tokens and forward pooled traffic to the parent, so the parent's token never reaches this server's agents. Routing is contributed only for providers the parent can serve.
-- **isolate**: neutralise the inherited routing and use this instance's own accounts, or each provider's own credentials.
-
-Proxied traffic authenticates as the parent machine's token, so the parent attributes it to itself.
+Open the composer’s + menu and select "Аккаунт". The menu groups pool accounts by provider. A different provider uses BB’s model selection and continues in a new thread through its native handoff. In a new thread, enter the prompt first and send it from the account picker. In an existing thread, choosing an account saves it for the next request. Auto prefers the lowest observed weekly usage for new conversations. CLI: `bb pool thread choose <thread-id> <account-id|auto>`.
 
 ## Requirements
 

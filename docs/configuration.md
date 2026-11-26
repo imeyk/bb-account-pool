@@ -1294,7 +1294,7 @@ Two host-daemon environment variables reach the Claude Code bridge:
 such as a CI runner (mint it with `claude setup-token`). See the
 `claude-code-provider` skill.
 
-### Account Pooler [Experimental]
+### Account Pooler (Fork)
 
 The builtin Account Pooler plugin pools Claude and Codex accounts behind the bb
 server. It is disabled on fresh installations (`bb plugin enable
@@ -1315,6 +1315,7 @@ and password together if the proxy requires credentials. Both `socks5://` and
 hostnames to the proxy for DNS resolution. Node emits an `ExperimentalWarning`
 on the first use of the agent in each process. A rollback to a build
 without per-account proxies ignores the setting and sends traffic directly.
+Use `bb pool account proxy-check <id>` to check a saved proxy or pass `--proxy-stdin` to check a replacement before saving. The probe sends an unauthenticated HTTPS HEAD request to the provider with a ten-second timeout and reports HTTP status and elapsed time.
 Before rolling back, remove per-account proxies with
 `bb pool account proxy <id> --off`.
 
@@ -1324,7 +1325,9 @@ Before rolling back, remove per-account proxies with
 | `anthropicUpstreamBaseUrl` | `https://api.anthropic.com`             | Upstream for Claude traffic; only for tests and QA with a fake upstream                                                                            |
 | `codexUpstreamBaseUrl`     | `https://chatgpt.com/backend-api/codex` | Upstream for Codex traffic; only for tests and QA with a fake upstream                                                                             |
 
-Inspect and change them with `bb pool config` and
+The plugin settings show **Режим ротации** under **Advanced**. `bb pool rotation weekly` (default) prefers the lowest known weekly usage among eligible accounts for a new automatic conversation. `bb pool rotation sequential` uses the current account and advances by priority on failover. Manual selections and existing conversation pins take precedence. `bb pool rotation` shows the saved mode.
+
+Inspect and change the settings in the table with `bb pool config` and
 `bb pool config set <key> <value>`. Values stored through `bb.settings` by
 older builds are not migrated. Provider routing is persisted per provider and
 defaults on; `bb pool routing <claude|codex> --off` stops it. See the

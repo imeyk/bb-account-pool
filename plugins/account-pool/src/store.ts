@@ -21,6 +21,8 @@ import {
   type AccountQuota,
   type AccountSecret,
   type HubTokenSummary,
+  rotationModeSchema,
+  type RotationMode,
   type PoolProvider,
 } from "./contracts.js";
 
@@ -705,6 +707,32 @@ export class RoutingStore {
     private readonly kv: PluginKvStorage,
     private readonly now: () => number = Date.now,
   ) {}
+
+  async rotationMode(): Promise<RotationMode> {
+    return rotationModeSchema.parse(
+      (await this.kv.get("routing.rotationMode")) ?? "weekly",
+    );
+  }
+
+  async setRotationMode(mode: RotationMode): Promise<void> {
+    await this.kv.set("routing.rotationMode", mode);
+  }
+
+  async threadChoice(threadId: string): Promise<string | null> {
+    return z
+      .string()
+      .uuid()
+      .nullable()
+      .parse((await this.kv.get(`codex-choice:${threadId}`)) ?? null);
+  }
+
+  async setThreadChoice(
+    threadId: string,
+    accountId: string | null,
+  ): Promise<void> {
+    if (accountId === null) await this.kv.delete(`codex-choice:${threadId}`);
+    else await this.kv.set(`codex-choice:${threadId}`, accountId);
+  }
 
   async isBypassed(threadId: string): Promise<boolean> {
     return (await this.kv.get(this.bypassKey(threadId))) === true;

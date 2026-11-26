@@ -19,6 +19,8 @@ import {
   modelFamilySchema,
   loginTargetSchema,
   parentModeSchema,
+  proxyCheckInputSchema,
+  rotationModeSchema,
   tokenRotateInputSchema,
   routingSetInputSchema,
   type AccountPoolConfig,
@@ -38,7 +40,7 @@ import type { ClaudeOAuthLogin } from "./oauth-login.js";
 import type { CodexDeviceLogin } from "./codex-device-login.js";
 
 const DESCRIPTION = [
-  "Accounts run sequentially by priority, then order added. The current fallback stays active until unavailable.",
+  "New automatic conversations prefer the lowest known weekly usage by default. Use bb pool rotation to show or change this choice.",
   "switchThreshold is a preference, not a cutoff: new conversations go to accounts below it first, existing conversations keep their account past it, and accounts at or above it keep serving until the provider refuses them. Status shows exhausted only for an account the provider refused.",
   "When this bb server runs inside another bb server's thread, parent proxy routes its pooled traffic through that parent; isolate neutralises the inherited routing.",
   "Reorder includes every account for the provider and changes the next failover sequence; existing conversations stay pinned.",
@@ -389,6 +391,47 @@ export function registerPoolCli(
                 stdout: input.options.json
                   ? json({ ok: true, account })
                   : `Added ${account.label} (${account.id}).\n`,
+              };
+            }),
+        }),
+        "account proxy-exit": cliCommand({
+          summary:
+            "Show the public IP and country observed through the saved account proxy",
+          positionals: [ACCOUNT_ID_POSITIONAL],
+          options: { json: JSON_OPTION },
+          run: (input) =>
+            attempt(async () => {
+              const { id } = accountIdInputSchema.parse({
+                id: input.positionals.id,
+              });
+              const exit = await operations.proxyExit(id);
+              return {
+                exitCode: exit ? 0 : 1,
+                stdout: input.options.json
+                  ? json({ exit })
+                  : exit
+                    ? `${exit.country} ${exit.ip}\n`
+                    : "Выходной IP неизвестен.\n",
+              };
+            }),
+        }),
+        "account proxy-check": cliCommand({
+          summary:
+            "Check the saved account proxy or test a new proxy before saving",
+          positionals: [ACCOUNT_ID_POSITIONAL],
+          options: { proxy: PROXY_OPTION, json: JSON_OPTION },
+          run: (input) =>
+            attempt(async () => {
+              const { id, proxy } = proxyCheckInputSchema.parse({
+                id: input.positionals.id,
+                proxy: input.options.proxy,
+              });
+              const result = await operations.checkProxy(id, proxy);
+              return {
+                exitCode: result.connected ? 0 : 1,
+                stdout: input.options.json
+                  ? json(result)
+                  : `${result.message}${result.status === null ? "" : ` HTTP ${result.status}.`} ${result.elapsedMs} мс.\n`,
               };
             }),
         }),
@@ -781,6 +824,30 @@ export function registerPoolCli(
               };
             }),
         }),
+        rotation: cliCommand({
+          summary:
+            "Show or select the account rotation mode for automatic conversations",
+          positionals: [
+            {
+              name: "mode",
+              description:
+                "weekly (lowest weekly usage) or sequential (priority order)",
+            },
+          ],
+          options: { json: JSON_OPTION },
+          run: (input) =>
+            attempt(async () => {
+              if (input.positionals.mode !== undefined)
+                await operations.setRotationMode(
+                  rotationModeSchema.parse(input.positionals.mode),
+                );
+              const mode = await operations.rotationMode();
+              return {
+                exitCode: 0,
+                stdout: input.options.json ? json({ mode }) : `${mode}\n`,
+              };
+            }),
+        }),
         config: cliCommand({
           summary: "Show Account Pooler routing configuration",
           options: { json: JSON_OPTION },
@@ -888,6 +955,33 @@ export function registerPoolCli(
                 stdout: input.options.json
                   ? json({ ok: true, token })
                   : `Rotated the Account Pooler token for ${token.hostName ?? token.hostId}.\n`,
+              };
+            }),
+        }),
+        "thread choose": cliCommand({
+          summary: "Choose a pooled account for a thread, or restore auto",
+          positionals: [
+            { name: "thread-id", description: "BB thread" },
+            { name: "account", description: "Account id or auto" },
+          ],
+          options: { json: JSON_OPTION },
+          run: (input) =>
+            attempt(async () => {
+              const threadId = input.positionals["thread-id"];
+              const account = input.positionals.account;
+              if (!threadId || !account)
+                throw new Error(
+                  "Usage: bb pool thread choose <thread-id> <account-id|auto>",
+                );
+              const selected = await operations.setThreadChoice(
+                threadId,
+                account === "auto" ? null : account,
+              );
+              return {
+                exitCode: 0,
+                stdout: input.options.json
+                  ? json({ threadId, accountId: selected })
+                  : (selected ?? "auto") + "\n",
               };
             }),
         }),

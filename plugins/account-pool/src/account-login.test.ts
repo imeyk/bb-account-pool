@@ -365,7 +365,10 @@ describe("Account Pooler logins", () => {
     });
     expect(requests.splice(0)).toEqual([["/usage", replacement]]);
     const proxyFile = path.join(
-      pool.host.bb.storage.experimental_directory(),
+      pool.host.bb.server.experimental_dataDir,
+      "plugins",
+      "account-pool",
+      "secrets",
       "accounts",
       `account-${account.id}.proxy.json`,
     );

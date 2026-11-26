@@ -6,7 +6,15 @@
   </picture>
 </p>
 
-# bb
+# Account Pooler (Fork) for bb
+
+This fork builds on bb's `desktop-v0.50.1` release. The `account-pool` branch contains the customized built-in plugin for Claude and Codex.
+
+Choose an account from the composer's **+** menu, or let the pool prefer the lowest weekly quota usage for new conversations. Each account can use its own HTTP(S) or SOCKS5 proxy. Settings show the proxy's exit country and IP and let you test the connection. Interrupted requests can retry through the proxy before streaming begins.
+
+The implementation lives in [plugins/account-pool](plugins/account-pool). See the [plugin overview](plugins/account-pool/PLUGIN_OVERVIEW.md) and [routing and proxy guide](plugins/account-pool/skills/account-pool/references/accounts-and-routing.md).
+
+## Upstream bb
 
 [![npm version](https://img.shields.io/npm/v/bb-app.svg)](https://www.npmjs.com/package/bb-app)
 [![Join Discord](https://img.shields.io/badge/Discord-Join%20server-5865F2?logo=discord&logoColor=white)](https://discord.gg/kvBU6tJhcJ)

@@ -10,6 +10,7 @@ import type { Dispatcher } from "undici";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import {
   createUpstreamTransport,
+  checkProxyConnection,
   transportErrorCode,
 } from "./upstream-transport.js";
 
@@ -180,6 +181,32 @@ async function socks5Proxy(target: URL, authenticate = false) {
     throw new Error("No proxy port");
   return { host: `127.0.0.1:${address.port}`, connections, credentials };
 }
+
+it("reports an actual proxy authentication rejection without reaching the provider", async () => {
+  const proxy = http.createServer();
+  const targets: Array<string | undefined> = [];
+  proxy.on("connect", (request, socket) => {
+    targets.push(request.url);
+    socket.end(
+      "HTTP/1.1 407 Proxy Authentication Required\r\nConnection: close\r\n\r\n",
+    );
+  });
+  proxy.listen(0, "127.0.0.1");
+  await once(proxy, "listening");
+  try {
+    const address = proxy.address();
+    if (!address || typeof address === "string")
+      throw new Error("Missing proxy port");
+    const result = await checkProxyConnection(
+      "codex",
+      `http://127.0.0.1:${address.port}`,
+    );
+    expect(result).toMatchObject({ connected: false, status: 407 });
+    expect(targets).toEqual(["chatgpt.com:443"]);
+  } finally {
+    await new Promise<void>((resolve) => proxy.close(() => resolve()));
+  }
+});
 
 it("routes an account through a CONNECT proxy and bypasses it for the default transport", async () => {
   const target = await upstream();

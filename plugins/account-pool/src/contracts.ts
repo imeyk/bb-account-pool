@@ -82,6 +82,9 @@ const switchThresholdSchema = z
   .positive("Must be greater than 0.")
   .max(1, "Must be at most 1.");
 
+export const rotationModeSchema = z.enum(["weekly", "sequential"]);
+export type RotationMode = z.infer<typeof rotationModeSchema>;
+
 export const parentModeSchema = z.enum(["proxy", "isolate"]);
 
 export const accountPoolConfigSchema = z
@@ -270,7 +273,11 @@ export type AccountQuota = z.infer<typeof quotaSchema>;
 export const accountSummarySchema = accountSchema.extend({
   lastUsedHostName: z.string().min(1).nullable(),
   proxy: z
-    .object({ scheme: proxySchemeSchema, host: z.string().min(1) })
+    .object({
+      scheme: proxySchemeSchema,
+      host: z.string().min(1),
+      authenticated: z.boolean().optional(),
+    })
     .strict()
     .nullable(),
   proxyUnreadable: z.boolean(),
@@ -312,6 +319,7 @@ export const statusSchema = z
     accepting: z.boolean(),
     hosts: z.array(hubTokenSummarySchema),
     accounts: z.array(accountSummarySchema),
+    rotationMode: rotationModeSchema.default("weekly"),
     routing: z.object({ claude: z.boolean(), codex: z.boolean() }).strict(),
     parent: z
       .object({
@@ -409,6 +417,45 @@ export const accountIdInputSchema = z
 export const accountSetProxyInputSchema = accountIdInputSchema.extend({
   proxy: proxyUrlSchema.nullable(),
 });
+
+export const proxyFieldsSchema = z
+  .object({
+    scheme: proxySchemeSchema,
+    host: z
+      .string()
+      .min(1)
+      .max(253)
+      .regex(/^[a-zA-Z0-9.:[\]_-]+$/),
+    port: z
+      .string()
+      .regex(/^\d{1,5}$/)
+      .refine((v) => Number(v) > 0 && Number(v) <= 65535),
+    user: z.string().max(1024).nullable(),
+    password: z.string().max(1024).nullable(),
+  })
+  .strict();
+export type ProxyFields = z.infer<typeof proxyFieldsSchema>;
+export const proxyEditorInput = accountIdInputSchema.extend({
+  fields: proxyFieldsSchema,
+});
+export const proxyExitSchema = z
+  .object({ ip: z.string(), country: z.string() })
+  .strict()
+  .nullable();
+export type ProxyExit = z.infer<typeof proxyExitSchema>;
+
+export const proxyCheckInputSchema = accountIdInputSchema.extend({
+  proxy: proxyUrlSchema.optional(),
+});
+export const proxyCheckResultSchema = z
+  .object({
+    connected: z.boolean(),
+    message: z.string(),
+    status: z.number().int().nullable(),
+    elapsedMs: z.number().int().nonnegative(),
+  })
+  .strict();
+export type ProxyCheckResult = z.infer<typeof proxyCheckResultSchema>;
 
 export const accountPriorityInputSchema = z
   .object({ accountId: z.string().uuid(), priority: z.number().int() })
