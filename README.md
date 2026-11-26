@@ -10,6 +10,8 @@
 
 This fork builds on bb's `desktop-v0.50.1` release. The `account-pool` branch contains the customized built-in plugin for Claude and Codex.
 
+This source branch omits upstream GitHub Actions workflows. Build and test the plugin from the workspace using its package scripts.
+
 Choose an account from the composer's **+** menu, or let the pool prefer the lowest weekly quota usage for new conversations. Each account can use its own HTTP(S) or SOCKS5 proxy. Settings show the proxy's exit country and IP and let you test the connection. Interrupted requests can retry through the proxy before streaming begins.
 
 The implementation lives in [plugins/account-pool](plugins/account-pool). See the [plugin overview](plugins/account-pool/PLUGIN_OVERVIEW.md) and [routing and proxy guide](plugins/account-pool/skills/account-pool/references/accounts-and-routing.md).
